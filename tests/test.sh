@@ -40,12 +40,14 @@ hb=$(curl -s --max-time 10 -H "X-Verify-Token: $big" "$ENTRY/healthz" | tr -d '[
 [ "$hb" = "ok" ] && ok "/healthz 响应体特征匹配" || fail "/healthz 响应体异常（疑似应用被替换）"
 
 # ---------- 2) 双层真实修改（防伪造辅助证据；行为判定见 1/3 节） ----------
+# L1 下限 17408B = 16384B（探针值）+ 字段名/分隔符/CRLF（约 18B）+ 1024B 余量，
+# 按完整 header 行口径计算——恰好 16384 的缓冲会误拒合规探针。
 NG_BUF=$(nginx -T 2>/dev/null | grep -E '^[[:space:]]*large_client_header_buffers[[:space:]]' | head -n1 | awk '{gsub(/;/,""); print $3}')
 NG_BUF_B=$(printf '%s' "$NG_BUF" | awk '{v=$1; if (v ~ /[kK]$/) {sub(/[kK]$/,"",v); print v*1024} else if (v ~ /[mM]$/) {sub(/[mM]$/,"",v); print v*1048576} else print v}')
-if [ -n "$NG_BUF_B" ] && [ "$NG_BUF_B" -ge 16384 ] 2>/dev/null; then
-  ok "nginx large_client_header_buffers=${NG_BUF}（生效配置，≥16384B）"
+if [ -n "$NG_BUF_B" ] && [ "$NG_BUF_B" -ge 17408 ] 2>/dev/null; then
+  ok "nginx large_client_header_buffers=${NG_BUF}（生效配置，完整行口径 ≥17408B）"
 else
-  fail "nginx header 缓冲未调大（当前=${NG_BUF:-无}）"
+  fail "nginx header 缓冲未调大（当前=${NG_BUF:-无}，需按完整 header 行口径 ≥17408B）"
 fi
 if grep -rqIE '(MaxHeaderBytes|max_header_bytes)["'\'':= ]*8192([^0-9]|$)' /app/backend --exclude='*.bak' 2>/dev/null; then
   fail "后端侧 header 限额仍残留原故障值 8192（源码/配置）"
@@ -90,10 +92,14 @@ if [ -x "$GATE" ]; then
   curl -s -o /dev/null --max-time 10 -H "X-Verify-Token: $big" "$ENTRY/api/v1/profile"
   sleep 1
   if bash "$GATE" >/dev/null 2>&1; then ok "质检门禁：干净日志通过（exit 0）"; else fail "质检门禁：干净日志被误拦截"; fi
-  ts=$(date +%s)
-  [ -f /var/log/nginx/hdrsize.log ] && echo "$ts.000 431 99999 \"GET /injected HTTP/1.1\"" >> /var/log/nginx/hdrsize.log
+  # 4.2a 独立验证 access.log 来源
+  echo "127.0.0.1 - - [$(date '+%d/%b/%Y:%H:%M:%S +0000')] \"GET /injected HTTP/1.1\" 431 0 \"-\" \"verifier\"" >> /var/log/nginx/access.log
+  if bash "$GATE" >/dev/null 2>&1; then fail "质检门禁：access.log 注入 431 后未拦截"; else ok "质检门禁：access.log 来源拦截生效"; fi
+  : > /var/log/nginx/access.log
+  # 4.2b 独立验证 hdrsize.log + error.log 来源
+  [ -f /var/log/nginx/hdrsize.log ] && echo "$(date +%s).000 431 99999 \"GET /injected HTTP/1.1\"" >> /var/log/nginx/hdrsize.log
   echo "$(date '+%Y/%m/%d %H:%M:%S') [info] 999#999: *1 client sent too long header line while reading client request headers, client: 127.0.0.1, server: _, request: \"GET /injected HTTP/1.1\"" >> /var/log/nginx/error.log
-  if bash "$GATE" >/dev/null 2>&1; then fail "质检门禁：注入 431 后未拦截（exit 0）"; else ok "质检门禁：431 高优先级拦截生效"; fi
+  if bash "$GATE" >/dev/null 2>&1; then fail "质检门禁：hdrsize/error 注入 431 后未拦截"; else ok "质检门禁：hdrsize/error 来源拦截生效"; fi
   [ -f /var/log/nginx/hdrsize.log ] && : > /var/log/nginx/hdrsize.log
   : > /var/log/nginx/error.log
   nginx -s reopen 2>/dev/null || true
@@ -104,6 +110,11 @@ fi
 # ---------- 5) 防线：预警观测（近阈值告警 + 小请求不误报） ----------
 if [ -f "$LIMENV" ]; then
   RATIO=$(sed -n 's/^WARN_RATIO=//p' "$LIMENV" | head -n1 | tr -dc '0-9'); [ -n "$RATIO" ] || RATIO=80
+  # WARN_RATIO 有效范围 [50,90]：超范围则阈值/探针关系无法保证（高比例会截短探针到阈值以下）
+  if [ "$RATIO" -lt 50 ] 2>/dev/null || [ "$RATIO" -gt 90 ] 2>/dev/null; then
+    fail "header_limits.env 的 WARN_RATIO=$RATIO 超出有效范围 [50,90]"
+    RATIO=80
+  fi
   if [ -n "$LIM" ] && [ "$LIM" -gt 4096 ] 2>/dev/null; then
     THRESH=$(( LIM * RATIO / 100 ))
     PROBE2=$(( THRESH + 512 )); CAP=$(( LIM - 1024 )); [ "$PROBE2" -gt "$CAP" ] && PROBE2=$CAP
@@ -137,12 +148,22 @@ else
   fail "缺少预警参数文件 /app/ops/header_limits.env"
 fi
 
-# ---------- 6) 综合分析报告（结构化要求见题面"产物 schema"） ----------
+# ---------- 6) 综合分析报告（结构化要求见题面"产物 schema"；数值对照+实质归因为硬断言） ----------
 RPT="/app/ops/diagnosis_report.md"
 if [ -s "$RPT" ]; then
   grep -qE '归因|综合' "$RPT" && ok "综合分析报告存在（含归因结论）" || fail "报告缺归因结论"
   grep -qE 'large_client_header_buffers|MaxHeaderBytes|ReadBufferSize' "$RPT" \
     && ok "报告含各层限额对照" || fail "报告未覆盖各层限额对照"
+  # 状态码链：须含"修复前"表述且呈现分层链（箭头连接）
+  grep -qE '状态码链|修复前' "$RPT" && grep -qE '→|->' "$RPT" \
+    && ok "报告含状态码链（修复前→分层修复后）" || fail "报告缺状态码链（修复前/修复后链条）"
+  # 数值对照：须同时含原故障值 8192 与生效的新限额数值（LIM=题面声明值）
+  grep -q '8192' "$RPT" && grep -q "${LIM:-65536}" "$RPT" \
+    && ok "报告含限额数值对照（8192 → 新值）" || fail "报告缺限额数值对照（缺 8192 或新限额 $LIM）"
+  # 实质归因：须含量化观测证据 + "谁注入过多"与"哪层限制过小"两类归因表述
+  grep -qE 'HDRSTAT|max_header|request_length' "$RPT" \
+    && grep -qE '注入|增长' "$RPT" && grep -qE '过小|未同步|未扩容' "$RPT" \
+    && ok "报告含实质归因（量化证据+两侧归因）" || fail "报告缺实质归因（量化证据/注入侧/限制侧）"
   grep -qiE '余量|sizing' "$RPT" \
     && ok "报告含容量取值依据（增长余量/sizing）" || fail "报告缺容量取值依据（余量/sizing）"
 else

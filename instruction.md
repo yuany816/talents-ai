@@ -23,15 +23,16 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
    /healthz）与直连后端均返回 200（与常规请求一致）；
 2. **限额语义保持**：调大 ≠ 取消——超过（你自己声明的）上限的请求仍应被拒绝；
 3. **双层真实修复（可被检查）**：
-   - nginx 生效配置（`nginx -T` 输出）中存在 `large_client_header_buffers`，单缓冲 ≥ 16384 字节
-     （接受 k/M 后缀写法）；
+   - nginx 生效配置（`nginx -T` 输出）中存在 `large_client_header_buffers`，单缓冲 ≥ 17408 字节
+     （17 KiB，按**完整 header 行**口径：16384B 值 + 字段名/": "/CRLF 约 18B + 1 KiB 余量；
+     接受 k/M 后缀写法）；
    - 后端侧的 header 限额真实调大并生效——它可能存在于标准库/框架层，也可能存在于
      业务代码及其配置文件中；原故障值 `8192` 不得残留于 /app/backend 的源码或配置
      （验题做字面匹配，见"验题契约"）；
 4. **持续防线，产物落盘于 /app/ops/**：
    - `header_limits.env`：链路限额与预警参数，**必须**包含 `NGINX_LARGE_HEADER_BUFFER_BYTES`
      （nginx 侧单 header 上限，字节，须与 nginx 生效单缓冲一致）与 `WARN_RATIO`
-     （预警阈值百分比，缺失时验题按 80 处理）；
+     （预警阈值百分比，有效范围 **[50, 90]**，缺失时验题按 80 处理）；
    - 观测能力（可由后端观测中间件在请求处理路径中同步实现，无独立常驻进程亦可）：
      请求达到阈值时向 `warnings.log` 追加告警行，**30 秒内**必须可观测到（行数增加）；
      远低于阈值的常规请求不得产生告警；
@@ -53,15 +54,15 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
 
 | 固定值 | 依据 |
 |---|---|
-| 探针 16384 字节 | 题面复现场景；高于旧 nginx 默认单行上限 8k 与后端旧故障值 8192 |
-| L1 要求 ≥16384B | 保证 16KB 探针能通过且高于旧默认 4×8k |
+| 探针 16384 字节 | 题面复现场景；高于旧 nginx 默认单行上限 8k 与后端旧故障值 8192。**完整 header 行 ≈16402B**（字段名 14B + ": " + 16384B + CRLF） |
+| L1 要求 ≥17408B（17KiB） | 完整 header 行口径：16384B 值 + 行开销约 18B + 1KiB 余量——恰好 16384 的缓冲会误拒合规探针 |
 | LIM 须 == nginx 生效单缓冲 | 边界与预警判定需与实际限额同一数值基准 |
 | 上边界探针 LIM+4096 | 必须越过声明上限以验证"仍被拒绝"；LIM>1MB 时跳过（受单参数长度限制） |
 | 预警探针 THRESH+512（≤LIM−1024） | 必须越过阈值触发告警，但不得越过上限 |
-| THRESH = LIM×RATIO/100，RATIO 缺省 80 | 题面"预警阈值取上限的 ~80%" |
+| THRESH = LIM×RATIO/100，RATIO 有效范围 [50,90] | 题面"预警阈值取上限的 ~80%"；范围内恒有 THRESH+512 ≤ LIM−1024（L≥17408 ⟹ 0.9L+512 ≤ L−1024），探针保证越过阈值且不越过上限 |
 | LIM ≤4096 视为缺失 | 低于旧故障值 8192 的一半，属未有效扩容 |
-| 静默窗口 10s / 告警窗口 30s | 覆盖 3s 级日志轮询粒度加反应余量 |
-| 注入日志行格式 | 与 nginx hdrsize/error 日志真实格式一致，用于触发门禁行为，非伪造结论 |
+| 静默窗口 10s / 告警窗口 30s | 覆盖请求时同步写入的观测粒度加反应余量 |
+| 注入日志行格式 | 与 nginx hdrsize/error/access 日志真实格式一致，用于触发门禁行为，非伪造结论 |
 
 **0) 环境在线**：入口与后端任一不可达 → 不通过。
 
@@ -73,8 +74,8 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
   等于 `ok`——证明是真实应用在服务，替换成"永远 200"的桩不会通过。
 
 **2) 双层真实修改（反硬编码判定范围，辅助证据）**：
-- L1：`nginx -T` 生效配置中 `large_client_header_buffers` 的**单缓冲**数值 ≥ 16384
-  （`k`/`M` 后缀折算；仅认未注释的活动指令）；
+- L1：`nginx -T` 生效配置中 `large_client_header_buffers` 的**单缓冲**数值 ≥ 17408
+  （完整 header 行口径，`k`/`M` 后缀折算；仅认未注释的活动指令）；
 - L2：对 /app/backend 下所有文本文件（源码与配置，排除 `*.bak` 备份）做原故障值
   `8192` 的字面匹配（`(^|[^0-9])8192([^0-9]|$)`），**命中即不通过**
   （原故障值必须从生效的源码/配置中真实移除）；调大到任何足够字节的表达式/数值均可，
@@ -92,22 +93,29 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
 **4) 质检门禁**：`/app/ops/quality_gate.sh` 存在且可执行。验题会：
 - **截断** /var/log/nginx/{access,error,hdrsize}.log（不存在则跳过）并 `nginx -s reopen`，
   重放一轮正常流量后，门禁必须 **exit 0**；
-- **注入**合成 431 证据（向 hdrsize.log 追加一行 `<unix秒>.000 431 99999 "GET /injected HTTP/1.1"`，
-  向 error.log 追加一行含 `client sent too long header line` 的 info 级记录）后，
-  门禁必须 **exit ≠ 0**；注入后验题会清理恢复；
+- **分源注入**合成 431 证据并分别验证拦截：
+  ① 仅向 access.log 追加一条 combined 格式的 431 记录 → 门禁必须 **exit ≠ 0**；
+  ② 再向 hdrsize.log 追加一行 `<unix秒>.000 431 99999 "GET /injected HTTP/1.1"`、
+     向 error.log 追加一行含 `client sent too long header line` 的 info 级记录 → 门禁必须 **exit ≠ 0**；
+  每轮注入后验题会清理恢复；
 - 你的门禁在 hdrsize.log 缺失时应跳过该来源（不得因此误拦或崩溃）。
 
 **5) 预警观测**：
 - 读取 header_limits.env：`NGINX_LARGE_HEADER_BUFFER_BYTES` 缺失（或 ≤4096）→ 不通过；
-  `WARN_RATIO` 缺失按 80；
+  `WARN_RATIO` 缺失按 80，**声明值超出 [50,90] → 不通过**；
 - 验题会再次清理 hdrsize.log 并进入**静默检查**：发送常规请求，10s 内 warnings.log
   行数不得增加（不得误报）；
 - **告警检查**：发送 THRESH+512 字节探针两次（立即一次、约 9 秒后一次），30s 内
   warnings.log 行数必须增加（即 `$request_length ≥ THRESH` 的请求必须被观测到）。
 
-**6) 综合分析报告**：/app/ops/diagnosis_report.md 非空；包含"归因"或"综合"表述；
-提及所修改的限制项名称（`large_client_header_buffers` / `MaxHeaderBytes` / `ReadBufferSize` 至少其一）；
-包含容量取值依据（出现"余量"或"sizing"表述，对应题面"为 Trace 上下文随跳数增长预留余量"）。
+**6) 综合分析报告**：/app/ops/diagnosis_report.md 非空；按以下硬断言校验——
+① 归因结论：含"归因"或"综合"；
+② 状态码链：含"状态码链"或"修复前"，且以箭头（→）呈现分层链条；
+③ 数值对照：同时含原故障值 `8192` 与生效的新限额数值（即题面声明的 `NGINX_LARGE_HEADER_BUFFER_BYTES`）；
+④ 实质归因：含量化观测证据（`HDRSTAT` / `max_header` / `request_length` 至少其一），
+   且同时具备"谁注入过多"（含"注入"或"增长"）与"哪层限制过小"（含"过小"/"未同步"/"未扩容"）两类表述；
+⑤ 容量依据：含"余量"或"sizing"；
+⑥ 提及所修改的限制项名称（`large_client_header_buffers` / `MaxHeaderBytes` / `ReadBufferSize` 至少其一）。
 
 **产物 schema（结构化输出契约，验题按此读取）**：
 - `/app/ops/header_limits.env`：KEY=VALUE 行；**必含** `NGINX_LARGE_HEADER_BUFFER_BYTES`
