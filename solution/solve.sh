@@ -65,16 +65,16 @@ probe() {
   local url="$1" hlen="${2:-}" tok=""
   if [ -n "$hlen" ]; then tok="$(head -c "$hlen" /dev/zero | tr '\0' 'x')"; fi
   if [ -n "$tok" ]; then
-    curl $CURL_TLS -s -o /dev/null -w '%{http_code}' --max-time 15 -H "X-Debug-Trace: $tok" "$url"
+    curl ${CURL_TLS:+"$CURL_TLS"} -s -o /dev/null -w '%{http_code}' --max-time 15 -H "X-Debug-Trace: $tok" "$url"
   else
-    curl $CURL_TLS -s -o /dev/null -w '%{http_code}' --max-time 15 "$url"
+    curl ${CURL_TLS:+"$CURL_TLS"} -s -o /dev/null -w '%{http_code}' --max-time 15 "$url"
   fi
 }
 
 wait_up() {  # 等端口可响应（任何 HTTP 状态都算活着）
   local url="$1" i
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    curl $CURL_TLS -s -o /dev/null --max-time 2 "$url" && return 0
+    curl ${CURL_TLS:+"$CURL_TLS"} -s -o /dev/null --max-time 2 "$url" && return 0
     sleep 1
   done
   return 1
@@ -164,7 +164,7 @@ pgrep -x nginx >/dev/null 2>&1 || { say "nginx 未运行，尝试启动"; \
   fi; sleep 1; }
 
 # 兜底启动后端（若直连不可达）：supervisorctl（环境由 supervisord 编排）
-if ! curl $CURL_TLS -s -o /dev/null --max-time 2 "${UPSTREAM_URL:-http://127.0.0.1:${UP_PORT}/}"healthz 2>/dev/null; then
+if ! curl ${CURL_TLS:+"$CURL_TLS"} -s -o /dev/null --max-time 2 "${UPSTREAM_URL:-http://127.0.0.1:${UP_PORT}/}"healthz 2>/dev/null; then
   say "后端不可达，尝试兜底拉起"
   if command -v supervisorctl >/dev/null 2>&1 && supervisorctl status >/dev/null 2>&1; then
     supervisorctl restart backend 2>/dev/null || supervisorctl restart all 2>/dev/null || warn "后端拉起失败（supervisorctl）"
@@ -192,12 +192,12 @@ NG_BUF_BEFORE="$(grep -rhE '^[[:space:]]*large_client_header_buffers[[:space:]]'
 say "L1 修改前取值: client_header_buffer_size=${NG_CHB_BEFORE} / large_client_header_buffers=${NG_BUF_BEFORE}"
 
 DISABLE_SED_RE='^([[:space:]]*)(client_header_buffer_size|large_client_header_buffers|log_format[[:space:]]+hdrsize|access_log[[:space:]][^;]*/var/log/nginx/(hdrsize\.log|access\.log))'
-grep -rlE "(^|[^A-Za-z0-9_])(client_header_buffer_size|large_client_header_buffers|log_format[[:space:]]+hdrsize|access_log[[:space:]][^;]*/var/log/nginx/(hdrsize\.log|access\.log))" /etc/nginx 2>/dev/null \
-| while read -r f; do
+# 进程替换读清单（管道 | while 会在子 shell 中运行，内部状态/变量无法同步回主 shell——阻断风险整改）
+while read -r f; do
     [ -f "$f" ] || continue
     backup "$f"
     sed -i -E "s@${DISABLE_SED_RE}@\1# disabled-by-solve.sh: \&@" "$f"
-  done
+done < <(grep -rlE "(^|[^A-Za-z0-9_])(client_header_buffer_size|large_client_header_buffers|log_format[[:space:]]+hdrsize|access_log[[:space:]][^;]*/var/log/nginx/(hdrsize\.log|access\.log))" /etc/nginx 2>/dev/null)
 
 NGINX_INS="$(mktemp /tmp/nginx_ins.XXXXXX)"
 cat > "$NGINX_INS" <<EOF
@@ -677,12 +677,17 @@ say "质检门禁: exit=${GATE_RC}（0=通过 / 2=拦截431）"
 WARN_PROBE_BYTES=$(( NG_BUF_KB * 1024 * 90 / 100 ))
 WARN_STATUS="$(probe "$ENTRY_URL" "$WARN_PROBE_BYTES")"
 say "预警观测探针(90%阈值): status=${WARN_STATUS}（header≈${WARN_PROBE_BYTES}B）"
-sleep 2
-if [ -s "$OPS_DIR/warnings.log" ]; then
+# 循环等待（最多 5s）：避免固定 sleep 在高负载下误判预警失效
+WARN_OK=0
+for _ in $(seq 1 5); do
+  if [ -s "$OPS_DIR/warnings.log" ]; then WARN_OK=1; break; fi
+  sleep 1
+done
+if [ "$WARN_OK" = "1" ]; then
   say "预警观测: warnings.log 已捕获接近阈值请求 ✅"
   tail -n 2 "$OPS_DIR/warnings.log"
 else
-  warn "预警观测: 暂未捕获预警（检查 $OPS_DIR/app.log 中 HDRSTAT 与中间件注入状态）"
+  warn "预警观测: 暂未捕获预警（检查 /var/log/backend.log 中 HDRSTAT 与中间件注入状态）"
 fi
 
 # ---------- 步骤⑩：431 综合分析报告（链路级归因，非单点归责） ----------
