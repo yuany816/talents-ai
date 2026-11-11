@@ -40,6 +40,7 @@ NG_BUF_KB=64                 # L1: large_client_header_buffers 单缓冲（单�
 APP_FASTHTTP_BUF=1048576     # L2: fasthttp/fiber ReadBufferSize
 APP_NETHTTP_MAX=4194304      # L2: net/http MaxHeaderBytes
 WARN_RATIO=80                # 预警阈值 = 上限的 80%
+WARN_THRESHOLD=$(( NG_BUF_KB * 1024 * WARN_RATIO / 100 ))   # 预警绝对阈值（字节），注入观测中间件
 
 ENTRY_URL=""; CURL_TLS=""
 UPSTREAM_URL=""; UP_PORT=""
@@ -144,14 +145,19 @@ NG_LOGS="$(grep -rhE '^[[:space:]]*(access_log|error_log)[[:space:]]' /etc/nginx
 /var/log/nginx/access.log
 /var/log/nginx/hdrsize.log"
 
-# 兜底启动 nginx（若环境未拉起）
-pgrep -x nginx >/dev/null 2>&1 || { say "nginx 未运行，尝试启动"; nginx 2>/dev/null || warn "nginx 启动失败（可能由 supervisor 管理）"; sleep 1; }
+# 兜底启动 nginx（若环境未拉起）：优先 supervisorctl（环境由 supervisord 编排）
+pgrep -x nginx >/dev/null 2>&1 || { say "nginx 未运行，尝试启动"; \
+  if command -v supervisorctl >/dev/null 2>&1 && supervisorctl status >/dev/null 2>&1; then
+    supervisorctl restart nginx 2>/dev/null || nginx
+  else
+    nginx 2>/dev/null || warn "nginx 启动失败"
+  fi; sleep 1; }
 
-# 兜底启动后端（若入口/直连均不可达）：优先用环境自带 entrypoint 的有限初始化模式（幂等）
-if ! curl $CURL_TLS -s -o /dev/null --max-time 2 "${UPSTREAM_URL:-http://127.0.0.1:${UP_PORT}/}healthz" 2>/dev/null; then
+# 兜底启动后端（若直连不可达）：优先 supervisorctl
+if ! curl $CURL_TLS -s -o /dev/null --max-time 2 "${UPSTREAM_URL:-http://127.0.0.1:${UP_PORT}/}"healthz 2>/dev/null; then
   say "后端不可达，尝试兜底拉起"
-  if [ -x /entrypoint.sh ]; then
-    /entrypoint.sh --init-only 2>/dev/null || true
+  if command -v supervisorctl >/dev/null 2>&1 && supervisorctl status >/dev/null 2>&1; then
+    supervisorctl restart backend 2>/dev/null || supervisorctl restart all 2>/dev/null || true
   elif [ -x "$MOD_DIR/backend" ]; then
     ( cd "$MOD_DIR" && nohup ./backend >>/var/log/backend.log 2>&1 < /dev/null & )
     disown 2>/dev/null || true
@@ -327,11 +333,28 @@ package ${PKG_NAME}
 
 import (
 	"fmt"
+	"os"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 )
 
-// headerStatFiber 逐 header 体积统计（归因：哪个模块/header 注入过多）
+// headerStatWarnThreshold 预警绝对阈值（字节）：达到即认为接近上限
+const headerStatWarnThreshold = ${WARN_THRESHOLD}
+
+func init() { _ = os.MkdirAll("/app/ops", 0o755) }
+
+// headerStatWarn 请求时同步写入预警（接近上限的请求在触发 431 之前即被感知）
+func headerStatWarn(path string, total int) {
+	f, err := os.OpenFile("/app/ops/warnings.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s WARN path=%s total=%dB >= 阈值=%dB（接近上限，请关注容量）\n", time.Now().Format("2006/01/02 15:04:05"), path, total, headerStatWarnThreshold)
+}
+
+// headerStatFiber 逐 header 体积统计（归因：哪个模块/header 注入过多）+ 阈值预警
 func headerStatFiber() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		total := 0
@@ -346,6 +369,9 @@ func headerStatFiber() fiber.Handler {
 			}
 		})
 		fmt.Printf("HDRSTAT path=%s total=%dB max_header=%s:%dB\n", c.Path(), total, topName, topSize)
+		if total >= headerStatWarnThreshold {
+			headerStatWarn(string(c.Path()), total)
+		}
 		return c.Next()
 	}
 }
@@ -362,11 +388,28 @@ package ${PKG_NAME}
 
 import (
 	"fmt"
+	"os"
+	"time"
 
 	"github.com/valyala/fasthttp"
 )
 
-// headerStatMiddleware 逐 header 体积统计（归因：哪个模块/header 注入过多）
+// headerStatWarnThreshold 预警绝对阈值（字节）：达到即认为接近上限
+const headerStatWarnThreshold = ${WARN_THRESHOLD}
+
+func init() { _ = os.MkdirAll("/app/ops", 0o755) }
+
+// headerStatWarn 请求时同步写入预警（接近上限的请求在触发 431 之前即被感知）
+func headerStatWarn(path string, total int) {
+	f, err := os.OpenFile("/app/ops/warnings.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s WARN path=%s total=%dB >= 阈值=%dB（接近上限，请关注容量）\n", time.Now().Format("2006/01/02 15:04:05"), path, total, headerStatWarnThreshold)
+}
+
+// headerStatMiddleware 逐 header 体积统计（归因：哪个模块/header 注入过多）+ 阈值预警
 func headerStatMiddleware(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
 		total := 0
@@ -381,6 +424,9 @@ func headerStatMiddleware(next fasthttp.RequestHandler) fasthttp.RequestHandler 
 			}
 		})
 		fmt.Printf("HDRSTAT path=%s total=%dB max_header=%s:%dB\n", string(ctx.Path()), total, topName, topSize)
+		if total >= headerStatWarnThreshold {
+			headerStatWarn(string(ctx.Path()), total)
+		}
 		next(ctx)
 	}
 }
@@ -398,9 +444,26 @@ package ${PKG_NAME}
 import (
 	"fmt"
 	"net/http"
+	"os"
+	"time"
 )
 
-// headerStatMiddleware 逐 header 体积统计（归因：哪个模块/header 注入过多）
+// headerStatWarnThreshold 预警绝对阈值（字节）：达到即认为接近上限
+const headerStatWarnThreshold = ${WARN_THRESHOLD}
+
+func init() { _ = os.MkdirAll("/app/ops", 0o755) }
+
+// headerStatWarn 请求时同步写入预警（接近上限的请求在触发 431 之前即被感知）
+func headerStatWarn(path string, total int) {
+	f, err := os.OpenFile("/app/ops/warnings.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s WARN path=%s total=%dB >= 阈值=%dB（接近上限，请关注容量）\n", time.Now().Format("2006/01/02 15:04:05"), path, total, headerStatWarnThreshold)
+}
+
+// headerStatMiddleware 逐 header 体积统计（归因：哪个模块/header 注入过多）+ 阈值预警
 func headerStatMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		total := 0
@@ -419,6 +482,9 @@ func headerStatMiddleware(next http.Handler) http.Handler {
 		}
 		total += len(r.RequestURI) + 16
 		fmt.Printf("HDRSTAT path=%s total=%dB max_header=%s:%dB\n", r.URL.Path, total, topName, topSize)
+		if total >= headerStatWarnThreshold {
+			headerStatWarn(r.URL.Path, total)
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -550,34 +616,6 @@ ORIG_APP_LIMIT="${APP_LIMIT_BEFORE}"
 ORIG_APP_QUOTA="${QUOTA_BEFORE}"
 EOF
 
-cat > "$OPS_DIR/header_size_watch.sh" <<'WEOF'
-#!/bin/bash
-# 预警观测：轮询 nginx hdrsize 日志（$msec $status $request_length），
-# 请求头长度达到上限 WARN_RATIO% 时写入 warnings.log —— 在真正触发 431 之前感知风险请求
-set -u
-. /app/ops/header_limits.env
-THRESH=$(( NGINX_LARGE_HEADER_BUFFER_BYTES * WARN_RATIO / 100 ))
-SRC=/var/log/nginx/hdrsize.log
-WARN_LOG=/app/ops/warnings.log
-pos=0
-while :; do
-  if [ -f "$SRC" ]; then
-    sz=$(stat -c %s "$SRC" 2>/dev/null || echo 0)
-    [ "$sz" -lt "$pos" ] && pos=0
-    if [ "$sz" -gt "$pos" ]; then
-      tail -c +$(( pos + 1 )) "$SRC" 2>/dev/null | while read -r msec status rlen _; do
-        case "${rlen:-}" in ''|*[!0-9]*) continue ;; esac
-        if [ "$rlen" -ge "$THRESH" ]; then
-          echo "$(date '+%F %T') WARN status=${status} request_length=${rlen}B >= ${THRESH}B(${WARN_RATIO}% of ${NGINX_LARGE_HEADER_BUFFER_BYTES}B)" >> "$WARN_LOG"
-        fi
-      done
-      pos=$sz
-    fi
-  fi
-  sleep 3
-done
-WEOF
-
 cat > "$OPS_DIR/quality_gate.sh" <<'GEOF'
 #!/bin/bash
 # 变更质检门禁：431 为高优先级拦截项
@@ -604,25 +642,15 @@ fi
 echo "[quality-gate] 通过：未发现 431"
 exit 0
 GEOF
-chmod 0755 "$OPS_DIR/header_size_watch.sh" "$OPS_DIR/quality_gate.sh"
+chmod 0755 "$OPS_DIR/quality_gate.sh"
 
-# ---------- 步骤⑧：清理历史日志，启动观测 ----------
-say "步骤⑧：清理历史日志，启动预警观测"
+# ---------- 步骤⑧：清理历史日志 ----------
+say "步骤⑧：清理历史日志（预警由后端观测中间件在请求时同步写入 warnings.log）"
 for lg in $NG_LOGS "$OPS_DIR/app.log"; do
   case "$lg" in /*) [ -f "$lg" ] && : > "$lg" ;; esac
 done
 nginx -s reopen 2>/dev/null || true
-
-pkill -f "ops/header_size_watch.sh" 2>/dev/null || true
-sleep 0.3
-if command -v setsid >/dev/null 2>&1; then
-  setsid bash "$OPS_DIR/header_size_watch.sh" >/dev/null 2>&1 < /dev/null &
-else
-  nohup bash "$OPS_DIR/header_size_watch.sh" >/dev/null 2>&1 < /dev/null &
-fi
-disown 2>/dev/null || true
-echo $! > "$OPS_DIR/watchdog.pid" 2>/dev/null || true
-say "预警 watchdog 已启动（pid=$(cat "$OPS_DIR/watchdog.pid" 2>/dev/null || echo '?')，阈值=${WARN_RATIO}% of $(( NG_BUF_KB * 1024 ))B）"
+: > "$OPS_DIR/warnings.log" 2>/dev/null || true
 
 # ---------- 步骤⑨：超长 header 端到端验证 + 门禁 ----------
 say "步骤⑨：超长 header 端到端验证"
@@ -644,16 +672,16 @@ bash "$OPS_DIR/quality_gate.sh" || GATE_RC=$?
 say "质检门禁: exit=${GATE_RC}（0=通过 / 2=拦截431）"
 [ "$GATE_RC" -ne 0 ] && PASS=0
 
-# 预警机制自证：90% 阈值探针应触发 warnings.log（不计入 PASS，时序异步）
+# 预警机制自证：90% 阈值探针应即时触发 warnings.log（观测中间件在请求时同步写入）
 WARN_PROBE_BYTES=$(( NG_BUF_KB * 1024 * 90 / 100 ))
 WARN_STATUS="$(probe "$ENTRY_URL" "$WARN_PROBE_BYTES")"
 say "预警观测探针(90%阈值): status=${WARN_STATUS}（header≈${WARN_PROBE_BYTES}B）"
-sleep 7
+sleep 2
 if [ -s "$OPS_DIR/warnings.log" ]; then
   say "预警观测: warnings.log 已捕获接近阈值请求 ✅"
   tail -n 2 "$OPS_DIR/warnings.log"
 else
-  warn "预警观测: 暂未捕获预警（watchdog 异步，检查 $OPS_DIR/watchdog.pid）"
+  warn "预警观测: 暂未捕获预警（检查 $OPS_DIR/app.log 中 HDRSTAT 与中间件注入状态）"
 fi
 
 # ---------- 步骤⑩：431 综合分析报告（链路级归因，非单点归责） ----------
@@ -738,7 +766,7 @@ hdr_top=${HDR_TOP:-NA}
 entry_request_length=${ENTRY_LEN}
 pass=${PASS}
 EOF
-say "产物: $OPS_DIR/{header_limits.env, header_size_watch.sh, quality_gate.sh, warnings.log, watchdog.pid, diagnosis_report.md, last_solve_result.txt}"
+say "产物: $OPS_DIR/{header_limits.env, quality_gate.sh, warnings.log, diagnosis_report.md, last_solve_result.txt}（观测能力内置于后端 headerStat 中间件）"
 
 if [ "$PASS" = "1" ]; then
   say "结果: PASS —— 431 双层修复完成，预警观测与质检门禁就绪"

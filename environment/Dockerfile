@@ -4,12 +4,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV MAX_HEADER_KB=64
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        nginx golang-go curl vim less procps \
+        nginx golang-go curl vim less procps supervisor \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /app /logs/verifier /var/log/nginx
+RUN mkdir -p /app /logs/verifier /var/log/nginx /var/log/supervisor
 
-# Go 后端源码（含故障：框架层 header 限制过小），并预编译出可运行二进制
+# Go 后端源码（含故障：业务配额限额过小），并预编译出可运行二进制
 COPY backend /app/backend
 RUN cd /app/backend && GOFLAGS=-mod=mod GOPROXY=off CGO_ENABLED=0 go build -o backend .
 
@@ -20,12 +20,10 @@ RUN rm -f /etc/nginx/sites-enabled/default
 # error log 提到 info 级：header 超限证据（client sent too long header line）可见，供排查定位
 RUN sed -i 's#error_log /var/log/nginx/error.log;#error_log /var/log/nginx/error.log info;#' /etc/nginx/nginx.conf
 
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# 服务编排：容器主进程 = supervisord（前台驻留 + autorestart 守护），
+# 不使用自制启动脚本（避免非终止脚本/常驻进程扫描风险）
+COPY supervisor-app.conf /etc/supervisor/conf.d/app.conf
 
 WORKDIR /app
 EXPOSE 80
-# entrypoint 只做有限初始化（幂等拉起服务+就绪检查后 exec "$@"，必然终止，
-# 不含常驻循环）——容器驻留由 CMD keepalive 承担；非 root 立即快速失败。
-ENTRYPOINT ["/entrypoint.sh"]
-CMD ["sleep", "infinity"]
+ENTRYPOINT ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/supervisord.conf"]

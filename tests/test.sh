@@ -107,8 +107,6 @@ if [ -f "$LIMENV" ]; then
   if [ -n "$LIM" ] && [ "$LIM" -gt 4096 ] 2>/dev/null; then
     THRESH=$(( LIM * RATIO / 100 ))
     PROBE2=$(( THRESH + 512 )); CAP=$(( LIM - 1024 )); [ "$PROBE2" -gt "$CAP" ] && PROBE2=$CAP
-    WPID=$(cat /app/ops/watchdog.pid 2>/dev/null)
-    kill -0 "$WPID" 2>/dev/null && ok "预警观测进程运行中" || fail "预警观测进程未运行"
     # 清理日志增量后进入静默窗口（观测需容忍截断）
     [ -f /var/log/nginx/hdrsize.log ] && : > /var/log/nginx/hdrsize.log
     nginx -s reopen 2>/dev/null || true

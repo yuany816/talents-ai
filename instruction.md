@@ -13,8 +13,8 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
 - 后端源码位于 /app/backend（标准 Go module，可离线编译；预编译二进制已随服务运行）
 - 已注册路由：`/api/v1/profile`（业务接口）、`/healthz`
 - 日志位置：nginx 在 /var/log/nginx/（error log 已开 info 级），后端 stdout/stderr 在 /var/log/backend.log
-- 服务管理：`/entrypoint.sh` 为幂等初始化脚本（启动/拉起 nginx 与后端 → 就绪检查后退出），
-  服务意外退出时可直接执行它恢复环境（需 root）
+- 服务管理：容器由 supervisord 驻留（backend / nginx 均 autorestart）；
+  `supervisorctl status` 查看，`supervisorctl restart [backend|nginx|all]` 手动恢复（需 root）
 - 复现方式：向入口发送携带超大自定义 header 的请求（例如值为 16384 字节的 X-Debug-Trace），
   对比直连后端（127.0.0.1:9000）的返回，观察响应码差异与各层日志
 
@@ -32,7 +32,7 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
    - `header_limits.env`：链路限额与预警参数，**必须**包含 `NGINX_LARGE_HEADER_BUFFER_BYTES`
      （nginx 侧单 header 上限，字节，须与 nginx 生效单缓冲一致）与 `WARN_RATIO`
      （预警阈值百分比，缺失时验题按 80 处理）；
-   - `header_size_watch.sh`（或等价观测进程，pid 记录于 `watchdog.pid`）：基于日志增量判断，
+   - 观测能力（可由后端观测中间件在请求处理路径中同步实现，无独立常驻进程亦可）：
      请求达到阈值时向 `warnings.log` 追加告警行，**30 秒内**必须可观测到（行数增加）；
      远低于阈值的常规请求不得产生告警；
    - `quality_gate.sh`：变更质检门禁，对日志中的 431 高优先级拦截——检查
@@ -99,7 +99,7 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
 
 **5) 预警观测**：
 - 读取 header_limits.env：`NGINX_LARGE_HEADER_BUFFER_BYTES` 缺失（或 ≤4096）→ 不通过；
-  `WARN_RATIO` 缺失按 80；校验 watchdog.pid 指向的观测进程存活；
+  `WARN_RATIO` 缺失按 80；
 - 验题会再次清理 hdrsize.log 并进入**静默检查**：发送常规请求，10s 内 warnings.log
   行数不得增加（不得误报）；
 - **告警检查**：发送 THRESH+512 字节探针两次（立即一次、约 9 秒后一次），30s 内
@@ -113,8 +113,7 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
 - `/app/ops/header_limits.env`：KEY=VALUE 行；**必含** `NGINX_LARGE_HEADER_BUFFER_BYTES`
   （整数，字节，等于 nginx 生效单缓冲）与 `WARN_RATIO`（整数，百分比，缺失按 80）；
   其余键（如框架层限额、原始值）可选；
-- `/app/ops/watchdog.pid`：单行整数，观测进程 PID，验题 `kill -0` 校验存活；
-- `/app/ops/warnings.log`：每行一条告警（自由文本，建议含时间与触发的 request_length）；
+- `/app/ops/warnings.log`：每行一条告警（自由文本，建议含时间与触发的请求大小）；
   验题只校验"行数在窗口内是否增加"；
 - `/var/log/nginx/hdrsize.log`（可选存在）：每行 `$msec $status $request_length "$request"`；
 - `/app/ops/diagnosis_report.md`：Markdown；必含 ①各层状态码链（修复前/分层修复后）
