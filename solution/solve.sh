@@ -785,9 +785,9 @@ say "产物: $OPS_DIR/{header_limits.env, quality_gate.sh, warnings.log, diagnos
 # [FIX] 合并结尾原先重复的两段 if [ "$PASS" = "1" ]（前一段只打印、后一段才 exit），
 #       并删除误导性的"常驻占位/等待平台销毁"注释段——平台期望 solve.sh 正常退出。
 if [ "$PASS" = "1" ]; then
-  say "[solve.sh] 结果: PASS —— 431 双层修复完成，预警观测与质检门禁就绪"
+  say "结果: PASS —— 431 双层修复完成，预警观测与质检门禁就绪"
   exit 0
 else
-  warn "[solve.sh] 结果: FAIL —— 详见 $OPS_DIR/last_solve_result.txt"
+  warn "结果: FAIL —— 详见 $OPS_DIR/last_solve_result.txt"
   exit 1
 fi
