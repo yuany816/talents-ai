@@ -19,5 +19,5 @@ timeout_sec = 300
 
 [metadata]
 difficulty = "hard"        # easy / medium / hard
-category = "physics-coding"
-tags = ["physics", "quantum-mechanics", "python", "pde"]
+category = "incident-coding"
+tags = ["nginx", "http-431", "go", "operations", "observability"]

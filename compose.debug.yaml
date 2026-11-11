@@ -1,0 +1,11 @@
+services:
+  project:
+    image: project
+    build:
+      context: ./environment
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80"
+    # 调试时保留容器 stdin，便于进入容器排查
+    stdin_open: true
+    tty: true

@@ -1,0 +1,8 @@
+services:
+  project:
+    image: project
+    build:
+      context: ./environment
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80"
