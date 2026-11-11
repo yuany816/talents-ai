@@ -1,5 +1,7 @@
 FROM debian:bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
+# 历史遗留：曾被认为可控制 header 上限的环境变量（现网保留，代码已不再读取）
+ENV MAX_HEADER_KB=64
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         nginx golang-go curl vim less procps \
@@ -23,4 +25,7 @@ RUN chmod +x /entrypoint.sh
 
 WORKDIR /app
 EXPOSE 80
+# entrypoint 只做有限初始化（幂等拉起服务+就绪检查后 exec "$@"，必然终止，
+# 不含常驻循环）——容器驻留由 CMD keepalive 承担；非 root 立即快速失败。
 ENTRYPOINT ["/entrypoint.sh"]
+CMD ["sleep", "infinity"]

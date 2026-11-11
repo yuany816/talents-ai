@@ -2,6 +2,11 @@
 # 431 任务验题脚本（平台 tests/test.sh）
 # 判定：端到端 + 双层真实修改（防伪造）+ 边界/输入覆盖 + 防线（门禁/预警）+ 综合归因报告
 # 行为正确性以探针（不同输入/边界）判定；源码/配置扫描仅作"修改真实发生"的辅助证据。
+# 测试依赖：bash/curl/nginx(仅 -T 读配置)/grep/awk/sed —— 均为环境镜像自带（见
+# environment/Dockerfile），无 Python/pip 依赖，无需在测试时额外安装。
+# 评分策略（3.7）：全部检查为硬性必要条件，采用 0/1 二值判定（无加权部分分）——
+# 任一检查失败即 reward=0，通过即 1；题面"判定总则"已声明该语义。reward.txt 总是被
+# 覆盖写入（0 或 1），不存在留空或沿用上次结果（3.5）。
 REWARD_FILE="/logs/verifier/reward.txt"
 mkdir -p /logs/verifier /var/log/nginx
 PASS=1
@@ -42,10 +47,10 @@ if [ -n "$NG_BUF_B" ] && [ "$NG_BUF_B" -ge 16384 ] 2>/dev/null; then
 else
   fail "nginx header 缓冲未调大（当前=${NG_BUF:-无}）"
 fi
-if grep -rqE 'MaxHeaderBytes:[[:space:]]*8192([^0-9]|$)' /app/backend --include='*.go' 2>/dev/null; then
-  fail "后端源码仍残留原故障值 MaxHeaderBytes:8192"
+if grep -rqIE '(MaxHeaderBytes|max_header_bytes)["'\'':= ]*8192([^0-9]|$)' /app/backend --exclude='*.bak' 2>/dev/null; then
+  fail "后端侧 header 限额仍残留原故障值 8192（源码/配置）"
 else
-  ok "后端源码框架限额已调整"
+  ok "后端侧 header 限额已真实调整（源码/配置扫描）"
 fi
 
 # ---------- 3) 边界与输入覆盖（以解题者声明的限额为基准） ----------
@@ -132,6 +137,18 @@ if [ -f "$LIMENV" ]; then
   fi
 else
   fail "缺少预警参数文件 /app/ops/header_limits.env"
+fi
+
+# ---------- 6) 综合分析报告（结构化要求见题面"产物 schema"） ----------
+RPT="/app/ops/diagnosis_report.md"
+if [ -s "$RPT" ]; then
+  grep -qE '归因|综合' "$RPT" && ok "综合分析报告存在（含归因结论）" || fail "报告缺归因结论"
+  grep -qE 'large_client_header_buffers|MaxHeaderBytes|ReadBufferSize' "$RPT" \
+    && ok "报告含各层限额对照" || fail "报告未覆盖各层限额对照"
+  grep -qiE '余量|sizing' "$RPT" \
+    && ok "报告含容量取值依据（增长余量/sizing）" || fail "报告缺容量取值依据（余量/sizing）"
+else
+  fail "缺少综合分析报告 /app/ops/diagnosis_report.md"
 fi
 
 # ---------- 结果 ----------

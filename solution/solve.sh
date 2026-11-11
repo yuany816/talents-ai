@@ -48,6 +48,7 @@ APPLIED_APP_LIMIT=0; SOURCE_CHANGED=0; CONFIG_CHANGED=0
 EDITED_FILES=""; MAIN_GO_FILES=""; NG_LOGS=""
 NG_CHB_BEFORE="未配置(默认1k)"; NG_BUF_BEFORE="未配置(默认4 8k)"
 APP_LIMIT_BEFORE="未知"; APP_KIND=""; WIRE_FILE=""; MID_FILE=""; MID_WIRED=0
+APP_QUOTA_MAX=1048576; QUOTA_APPLIED=0; QUOTA_BEFORE=""
 
 say()  { echo "[solve.sh] $*"; }
 warn() { echo "[solve.sh][WARN] $*" >&2; }
@@ -100,7 +101,7 @@ case "$PORT" in *:*) PORT="${PORT##*:}";; esac
 PORT="$(printf '%s' "$PORT" | tr -dc '0-9')"
 [ -z "$PORT" ] && PORT=80
 case "$LISTEN_LINE" in *ssl*) SCHEME="https"; CURL_TLS="-k";; *) SCHEME="http";; esac
-ENTRY_URL="${SCHEME}://127.0.0.1:${PORT}/"
+ENTRY_URL="${SCHEME}://127.0.0.1:${PORT}/healthz"
 say "入口: $ENTRY_URL"
 
 # 上游 Go 后端地址（proxy_pass / upstream 块）
@@ -118,6 +119,8 @@ if [ -n "$UP_HOST" ]; then
 fi
 UP_PORT="$(printf '%s' "$UPSTREAM_URL" | sed -nE 's#^https?://[^/]*:([0-9]+)/?$#\1#p')"
 [ -z "$UP_PORT" ] && UP_PORT=80
+# 探针路径：打真实路由（后端无根路由，/ 返回 404 会干扰可读性）
+[ -n "$UPSTREAM_URL" ] && UPSTREAM_URL="${UPSTREAM_URL}healthz"
 say "上游: ${UPSTREAM_URL:-未知}（端口 $UP_PORT）"
 
 # Go 模块（约定 /app 下，多模块时优先 server/backend 命名）
@@ -143,6 +146,18 @@ NG_LOGS="$(grep -rhE '^[[:space:]]*(access_log|error_log)[[:space:]]' /etc/nginx
 
 # 兜底启动 nginx（若环境未拉起）
 pgrep -x nginx >/dev/null 2>&1 || { say "nginx 未运行，尝试启动"; nginx 2>/dev/null || warn "nginx 启动失败（可能由 supervisor 管理）"; sleep 1; }
+
+# 兜底启动后端（若入口/直连均不可达）：优先用环境自带 entrypoint 的有限初始化模式（幂等）
+if ! curl $CURL_TLS -s -o /dev/null --max-time 2 "${UPSTREAM_URL:-http://127.0.0.1:${UP_PORT}/}healthz" 2>/dev/null; then
+  say "后端不可达，尝试兜底拉起"
+  if [ -x /entrypoint.sh ]; then
+    /entrypoint.sh --init-only 2>/dev/null || true
+  elif [ -x "$MOD_DIR/backend" ]; then
+    ( cd "$MOD_DIR" && nohup ./backend >>/var/log/backend.log 2>&1 < /dev/null & )
+    disown 2>/dev/null || true
+  fi
+  sleep 1
+fi
 
 # ---------- 步骤①：复现故障，识别 431 ----------
 say "步骤①：复现故障（超长 header ${TEST_HEADER_BYTES}B 打入口）"
@@ -279,18 +294,22 @@ if [ "$APPLIED_APP_LIMIT" = "0" ] && has_pattern 'http\.Server{'; then
   done
 fi
 
-# 4.3 配置文件兜底（yaml/json/toml/env 中声明的限额）
-if [ "$APPLIED_APP_LIMIT" = "0" ]; then
-  for cf in $(find "$MOD_DIR" -maxdepth 3 -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.json' -o -name '*.toml' -o -name '*.ini' -o -name '*.conf' -o -name '*.env' \) -not -path '*/vendor/*' 2>/dev/null); do
-    grep -qiE '(max_header_bytes|read_buffer_size|header_buffer_size)' "$cf" || continue
-    APP_LIMIT_BEFORE="$(grep -hoiE '(max_header_bytes|max_header_size|read_buffer_size|header_buffer_size)[^0-9]*[0-9]+' "$cf" | head -n1)"
-    backup "$cf"; CONFIG_CHANGED=1
-    sed -i -E "s/((max_header_bytes|max_header_size)[\"' ]*[:=][\"' ]*)[0-9]+/\1${APP_NETHTTP_MAX}/g;
-               s/((read_buffer_size|header_buffer_size)[\"' ]*[:=][\"' ]*)[0-9]+/\1${APP_FASTHTTP_BUF}/g" "$cf"
-    APPLIED_APP_LIMIT="$APP_NETHTTP_MAX"
-    say ">> 配置驱动限额已调大: $cf"
-  done
-fi
+# 4.3 业务配额/配置层限额（无条件幂等加固：配额中间件等配置驱动的限制同样要调大，
+#     否则仅修框架层时业务配额仍会拦截）
+for cf in $(find "$MOD_DIR" -maxdepth 3 -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.json' -o -name '*.toml' -o -name '*.ini' -o -name '*.conf' -o -name '*.env' \) -not -path '*/vendor/*' 2>/dev/null); do
+  QRE="max_header_bytes[\"':= ]*[0-9]+"
+  grep -qiE "$QRE" "$cf" 2>/dev/null || continue
+  QUOTA_BEFORE="$(grep -hoiE "$QRE" "$cf" | head -n1 | grep -oE '[0-9]+$')"
+  backup "$cf"
+  sed -i -E "s/((max_header_bytes|max_header_size)[\"' ]*[:=][\"' ]*)[0-9]+/\1${APP_QUOTA_MAX}/g;
+             s/((read_buffer_size|header_buffer_size)[\"' ]*[:=][\"' ]*)[0-9]+/\1${APP_FASTHTTP_BUF}/g" "$cf"
+  if [ "$(grep -hoiE "$QRE" "$cf" | head -n1 | grep -oE '[0-9]+$')" = "$APP_QUOTA_MAX" ]; then
+    QUOTA_APPLIED=1; CONFIG_CHANGED=1
+    say ">> 业务配额/配置层已调大: $cf（${QUOTA_BEFORE:-?} → ${APP_QUOTA_MAX}）"
+  else
+    warn "配额调整未生效，请人工检查 $cf"
+  fi
+done
 
 # 4.4 注入逐 header 体积统计中间件（归因观测：哪个模块/header 注入过多）
 if [ "$SOURCE_CHANGED" = "1" ] && [ -n "$WIRE_FILE" ] && [ -n "$APP_KIND" ]; then
@@ -334,7 +353,7 @@ EOF
       ;;
     fasthttp)
       if ! grep -q 'headerStatMiddleware(' "$WIRE_FILE"; then
-        sed -i -E "s/(Handler:[[:space:]]*)([a-zA-Z_][a-zA-Z0-9_.]*(\(\))?)(,?)/\1headerStatMiddleware(\2)\4/" "$WIRE_FILE"
+        sed -i -E "s/(Handler:[[:space:]]*)([a-zA-Z_][a-zA-Z0-9_.]*(\([^()]*\))?)(,?)/\1headerStatMiddleware(\2)\4/" "$WIRE_FILE"
       fi
       if grep -q 'headerStatMiddleware(' "$WIRE_FILE"; then MID_WIRED=1; else warn "fasthttp Handler 未识别，逐头归因降级"; fi
       MID_FILE="$PDIR/headerstat_fasthttp.go"
@@ -369,7 +388,7 @@ EOF
       ;;
     nethttp)
       if ! grep -q 'headerStatMiddleware(' "$WIRE_FILE"; then
-        sed -i -E "s/(Handler:[[:space:]]*)([a-zA-Z_][a-zA-Z0-9_.]*(\(\))?)(,?)/\1headerStatMiddleware(\2)\4/" "$WIRE_FILE"
+        sed -i -E "s/(Handler:[[:space:]]*)([a-zA-Z_][a-zA-Z0-9_.]*(\([^()]*\))?)(,?)/\1headerStatMiddleware(\2)\4/" "$WIRE_FILE"
       fi
       if grep -q 'headerStatMiddleware(' "$WIRE_FILE"; then MID_WIRED=1; else warn "net/http Handler 字段未识别，逐头归因降级"; fi
       MID_FILE="$PDIR/headerstat_nethttp.go"
@@ -409,13 +428,14 @@ EOF
   [ -n "$MID_FILE" ] && say "归因观测中间件: $MID_FILE（wired=$MID_WIRED）"
 fi
 
-if [ "$APPLIED_APP_LIMIT" = "0" ]; then
+if [ "$APPLIED_APP_LIMIT" = "0" ] && [ "$QUOTA_APPLIED" = "0" ]; then
   if [ "$AFTER_NGINX" = "431" ]; then
     die "复测仍 431 且未能在源码/配置中定位框架层 header 限制，请人工确认环境"
   fi
   say ">> 未发现后端 header 限制点，且当前无 431 —— 跳过 L2"
 else
-  say ">> 后端限额已调至 ${APPLIED_APP_LIMIT}B（修改:$EDITED_FILES）"
+  _qlim=0; [ "$QUOTA_APPLIED" = "1" ] && _qlim="$APP_QUOTA_MAX"
+  say ">> 后端限额已调至 框架层=${APPLIED_APP_LIMIT}B / 业务配额=${_qlim}B（修改:$EDITED_FILES）"
 fi
 
 # ---------- 步骤⑤：重新编译打包 ----------
@@ -513,19 +533,21 @@ if [ -f "$OPS_DIR/header_limits.env" ]; then
   _o1="$(sed -n 's/^ORIG_NG_CHB=//p' "$OPS_DIR/header_limits.env" | head -n1 | tr -d '"')"; [ -n "$_o1" ] && NG_CHB_BEFORE="$_o1"
   _o2="$(sed -n 's/^ORIG_NG_BUF=//p'  "$OPS_DIR/header_limits.env" | head -n1 | tr -d '"')"; [ -n "$_o2" ] && NG_BUF_BEFORE="$_o2"
   _o3="$(sed -n 's/^ORIG_APP_LIMIT=//p' "$OPS_DIR/header_limits.env" | head -n1 | tr -d '"')"; [ -n "$_o3" ] && APP_LIMIT_BEFORE="$_o3"
+  _o4="$(sed -n 's/^ORIG_APP_QUOTA=//p' "$OPS_DIR/header_limits.env" | head -n1 | tr -d '"')"; [ -n "$_o4" ] && QUOTA_BEFORE="$_o4"
 fi
 cat > "$OPS_DIR/header_limits.env" <<EOF
 # solve.sh 生成 —— 全链路 header 限额与预警参数（单一事实来源）
 NGINX_CLIENT_HEADER_BUFFER_BYTES=$(( NG_CHB_KB * 1024 ))
 NGINX_LARGE_HEADER_BUFFER_COUNT=${NG_BUF_N}
 NGINX_LARGE_HEADER_BUFFER_BYTES=$(( NG_BUF_KB * 1024 ))
-APP_MAX_HEADER_BYTES=${APPLIED_APP_LIMIT}
+APP_MAX_HEADER_BYTES=$(( QUOTA_APPLIED == 1 ? APP_QUOTA_MAX : APPLIED_APP_LIMIT ))
 WARN_RATIO=${WARN_RATIO}
 ENTRY_URL=${ENTRY_URL}
 UPSTREAM_URL=${UPSTREAM_URL}
 ORIG_NG_CHB="${NG_CHB_BEFORE}"
 ORIG_NG_BUF="${NG_BUF_BEFORE}"
 ORIG_APP_LIMIT="${APP_LIMIT_BEFORE}"
+ORIG_APP_QUOTA="${QUOTA_BEFORE}"
 EOF
 
 cat > "$OPS_DIR/header_size_watch.sh" <<'WEOF'
@@ -651,6 +673,11 @@ case "${APP_KIND}" in
   *)        APP_LABEL="Go 后端";                 L2_KEY="header 限额";;
 esac
 
+ROW_QUOTA=""
+if [ "$QUOTA_APPLIED" = "1" ]; then
+  ROW_QUOTA="| L2 | ${APP_LABEL}（业务配额中间件，启动时从配置加载） | max_header_bytes | ${QUOTA_BEFORE:-?} | ${APP_QUOTA_MAX} |"
+fi
+
 if [ -n "$HDR_TOP" ]; then
   ATTR_DETAIL="- 逐 header 归因（后端 HDRSTAT 中间件）：请求头总长 ${HDR_TOTAL:-?}B，单个最大 header 为 ${HDR_TOP} —— 注入该 header 的上游模块（网关/认证/链路追踪等）是 header 体量增长的主要来源"
 else
@@ -673,6 +700,7 @@ cat > "$REPORT" <<EOF
 | L1 | nginx（入口反代） | client_header_buffer_size | ${NG_CHB_BEFORE} | ${NG_CHB_KB}k |
 | L1 | nginx（入口反代） | large_client_header_buffers | ${NG_BUF_BEFORE} | ${NG_BUF_N} ${NG_BUF_KB}k |
 | L2 | ${APP_LABEL} | ${L2_KEY} | ${APP_LIMIT_BEFORE} | ${APPLIED_APP_LIMIT} |
+${ROW_QUOTA}
 
 结论：修复前 nginx 与后端两层阈值均低于上游注入的 header 体量（复现探针 ${TEST_HEADER_BYTES}B），属多模块限制过小。
 
