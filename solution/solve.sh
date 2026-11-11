@@ -25,6 +25,9 @@
 #           nginx 与 Go 服务同容器；Go 模块位于 /app 下（含 go.mod）。
 # 幂等性：所有配置/源码修改均先注释旧值或带 grep 守卫再写入，备份为 *.solve.bak；
 #         重复执行不会叠加破坏环境；离线优先（GOPROXY=off），在线仅作兜底。
+# 退出语义：脚本跑完一轮后按 PASS/FAIL 返回 exit 0/1，交由平台按 reward 判定；
+#          所有可能长时间挂起的步骤（go build / supervisord / supervisorctl / nginx）
+#          均加 timeout 或强制 daemon 化，避免被平台误判为 non_terminating_process。
 # =============================================================================
 set -uo pipefail   # 不用 -e：探针 431 / grep 无匹配属预期分支，失败点均显式处理
 export LC_ALL=C
@@ -53,9 +56,9 @@ APP_QUOTA_MAX=1048576; QUOTA_APPLIED=0; QUOTA_BEFORE=""
 
 say()  { echo "[solve.sh] $*"; }
 warn() { echo "[solve.sh][WARN] $*" >&2; }
-# FATAL：给出原因后转入常驻占位——平台要求入口进程不得退出（否则直接告警）；
-# 失败结果交给验题阶段按 reward=0 判定，容器保持存活等待平台销毁。
-die()  { echo "[solve.sh][FATAL] $*" >&2; exec tail -f /dev/null; }
+# [FIX] 原注释误写"平台要求入口进程不得退出"，与实测 non_terminating_process 完全相反，已修正。
+# FATAL：打印原因后以非 0 退出，交由平台按 reward=0 判定失败。
+die()  { echo "[solve.sh][FATAL] $*" >&2; exit 1; }
 
 mkdir -p "$OPS_DIR" /var/log/nginx
 backup() { [ -f "$1" ] && [ ! -f "$1.solve.bak" ] && cp -p "$1" "$1.solve.bak" || true; }
@@ -150,7 +153,8 @@ NG_LOGS="$(grep -rhE '^[[:space:]]*(access_log|error_log)[[:space:]]' /etc/nginx
 # 若 supervisord 未运行（solve 作为容器入口先于编排启动的场景），先拉起编排
 if command -v supervisorctl >/dev/null 2>&1 && ! supervisorctl status >/dev/null 2>&1; then
   say "supervisord 未运行，拉起服务编排"
-  supervisord -c /etc/supervisor/supervisord.conf 2>/dev/null || true
+  # [FIX] 加 timeout 防止 supervisord 被配置成 nodaemon=true 时永久阻塞
+  timeout 10 supervisord -c /etc/supervisor/supervisord.conf 2>/dev/null || true
   sleep 2
   supervisorctl status >/dev/null 2>&1 || die "supervisord 拉起失败"
 fi
@@ -235,10 +239,12 @@ if ! nginx -t 2>&1; then
   for b in $(find /etc/nginx -name '*.solve.bak' 2>/dev/null); do cp -p "$b" "${b%.solve.bak}"; done
   die "nginx 配置校验失败（已回滚）"
 fi
+# [FIX] 强制 daemon on：若 nginx.conf 带 `daemon off;`（容器镜像常见），直接 `nginx` 会前台阻塞，
+#       导致 solve.sh 永久挂起并触发 non_terminating_process。统一加 `-g 'daemon on;'`。
 if pgrep -x nginx >/dev/null 2>&1; then
-  nginx -s reload 2>/dev/null || { pkill -x nginx 2>/dev/null || true; sleep 1; nginx; }
+  nginx -s reload 2>/dev/null || { pkill -x nginx 2>/dev/null || true; sleep 1; nginx -g 'daemon on;'; }
 else
-  nginx
+  nginx -g 'daemon on;'
 fi
 sleep 1
 say "L1 已生效: $(nginx -T 2>/dev/null | grep -E 'client_header_buffer_size|large_client_header_buffers' | head -n2 | tr '\n' ' ')"
@@ -527,9 +533,10 @@ if [ "$SOURCE_CHANGED" = "1" ]; then
   done
   MODFLAGS="-mod=mod"; [ -d "$MOD_DIR/vendor" ] && MODFLAGS="-mod=vendor"
   NEW_BIN="$(mktemp /tmp/appbin.XXXXXX)"
-  if ! ( cd "$MOD_DIR" && GOPROXY=off GOTOOLCHAIN=local GOFLAGS="$MODFLAGS" CGO_ENABLED=0 go build -o "$NEW_BIN" "$MAIN_PKG" ); then
+  # [FIX] 离线/在线编译均加 timeout 300，避免 Go 模块下载或工具链卡死导致永久挂起
+  if ! ( cd "$MOD_DIR" && timeout 300 env GOPROXY=off GOTOOLCHAIN=local GOFLAGS="$MODFLAGS" CGO_ENABLED=0 go build -o "$NEW_BIN" "$MAIN_PKG" ); then
     warn "离线编译失败，尝试在线模块兜底"
-    if ! ( cd "$MOD_DIR" && GOFLAGS="$MODFLAGS" CGO_ENABLED=0 go build -o "$NEW_BIN" "$MAIN_PKG" ); then
+    if ! ( cd "$MOD_DIR" && timeout 300 env GOFLAGS="$MODFLAGS" CGO_ENABLED=0 go build -o "$NEW_BIN" "$MAIN_PKG" ); then
       rm -f "$MID_FILE"
       for f in $EDITED_FILES; do [ -f "$f.solve.bak" ] && cp -p "$f.solve.bak" "$f"; done
       die "go build 失败，已回滚源码修改"
@@ -583,7 +590,8 @@ if [ "$SOURCE_CHANGED" = "1" ] || [ "$CONFIG_CHANGED" = "1" ]; then
     PROG="$(supervisorctl status 2>/dev/null | sed -nE 's/^([[:space:]]*[^[:space:]:]+).*/\1/p' | tr -d ' ' \
            | grep -Ei 'app|go|server|backend' | head -n1)"
     [ -z "$PROG" ] && PROG="$(supervisorctl status 2>/dev/null | sed -nE 's/^([[:space:]]*[^[:space:]:]+).*/\1/p' | head -n1 | tr -d ' ')"
-    [ -n "$PROG" ] && { supervisorctl restart "$PROG" && RESTARTED=1; }
+    # [FIX] 加 timeout 60，避免被托管进程 ignore SIGTERM 导致 restart 卡死
+    [ -n "$PROG" ] && { timeout 60 supervisorctl restart "$PROG" && RESTARTED=1; }
   fi
   if [ "$RESTARTED" = "0" ]; then
     die "未能通过 supervisorctl 重启服务（环境应为 supervisord 编排）"
@@ -774,14 +782,12 @@ pass=${PASS}
 EOF
 say "产物: $OPS_DIR/{header_limits.env, quality_gate.sh, warnings.log, diagnosis_report.md, last_solve_result.txt}（观测能力内置于后端 headerStat 中间件）"
 
+# [FIX] 合并结尾原先重复的两段 if [ "$PASS" = "1" ]（前一段只打印、后一段才 exit），
+#       并删除误导性的"常驻占位/等待平台销毁"注释段——平台期望 solve.sh 正常退出。
 if [ "$PASS" = "1" ]; then
-  say "结果: PASS —— 431 双层修复完成，预警观测与质检门禁就绪"
+  say "[solve.sh] 结果: PASS —— 431 双层修复完成，预警观测与质检门禁就绪"
+  exit 0
 else
-  warn "结果: FAIL —— 详见 $OPS_DIR/last_solve_result.txt"
+  warn "[solve.sh] 结果: FAIL —— 详见 $OPS_DIR/last_solve_result.txt"
+  exit 1
 fi
-
-# ========= 常驻占位：一轮修复+验证+报告全部执行完毕，不再重复执行修复逻辑 =========
-# 平台要求入口进程跑完一轮后阻塞常驻、等待平台销毁；exec 直接替换当前进程，
-# 不产生额外子进程（K8s 容器常驻标准做法；不使用死循环 sleep）。
-say "[solve.sh] 一轮验题全部执行完毕，进入常驻占位，等待平台销毁，不再重复执行修复逻辑"
-exec tail -f /dev/null
