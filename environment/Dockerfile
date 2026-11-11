@@ -1,6 +1,6 @@
 FROM debian:bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
-# 历史遗留：曾被认为可控制 header 上限的环境变量（现网保留，代码已不再读取）
+# 历史环境变量
 ENV MAX_HEADER_KB=64
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

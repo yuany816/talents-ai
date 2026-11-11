@@ -76,8 +76,7 @@ func main() {
 		fmt.Fprintln(w, "ok")
 	})
 
-	// 注：431 上报后曾被判断为"入口层限制"，等待网关团队修复；入口层调整后故障依旧，
-	// 期间本服务的配额逻辑未再评估。
+	// 备注：历史上曾有 431 反馈被初步归因到入口层；任何限额调整后需全链路复测确认。
 	srv := &http.Server{
 		Addr:           "127.0.0.1:9000",
 		Handler:        headerQuotaMiddleware(quotaLimit, mux),
