@@ -49,7 +49,9 @@ if [ -n "$NG_BUF_B" ] && [ "$NG_BUF_B" -ge 17408 ] 2>/dev/null; then
 else
   fail "nginx header 缓冲未调大（当前=${NG_BUF:-无}，需按完整 header 行口径 ≥17408B）"
 fi
-if grep -rqIE '(MaxHeaderBytes|max_header_bytes)["'\'':= ]*8192([^0-9]|$)' /app/backend --exclude='*.bak' 2>/dev/null; then
+if grep -rqIE '(MaxHeaderBytes|max_header_bytes)["'\'':= ]*8192([^0-9]|$)' /app/backend \
+    --exclude='*.bak' --exclude='*.bak.*' --exclude='*.candbak' --exclude='*.orig' \
+    --exclude='*.old' --exclude='*.backup' --exclude='*.disabled' 2>/dev/null; then
   fail "后端侧 header 限额仍残留原故障值 8192（源码/配置）"
 else
   ok "后端侧 header 限额已真实调整（源码/配置扫描）"

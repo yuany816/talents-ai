@@ -26,4 +26,6 @@ COPY supervisor-app.conf /etc/supervisor/conf.d/app.conf
 
 WORKDIR /app
 EXPOSE 80
-ENTRYPOINT ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/supervisord.conf"]
+# Harbor 的 compose 运行时会向 ENTRYPOINT 追加 keepalive command；
+# supervisord 不接受位置参数（追加即 exit 2），故用 bash -c 固定脚本形态忽略追加参数。
+ENTRYPOINT ["/bin/bash", "-c", "exec /usr/bin/supervisord -n -c /etc/supervisor/supervisord.conf"]
