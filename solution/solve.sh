@@ -627,7 +627,7 @@ EOF
 
 cat > "$OPS_DIR/quality_gate.sh" <<'GEOF'
 #!/bin/bash
-# 变更质检门禁：431 为高优先级拦截项
+# 变更质检门禁：431 为高优先级拦截项（仅拦时间窗内的 431；历史记录不误拦）
 # 用法：bash /app/ops/quality_gate.sh  →  exit 0 通过 / exit 2 拦截
 set -u
 WINDOW=${GATE_WINDOW_SECONDS:-300}
@@ -638,17 +638,35 @@ if [ -f /var/log/nginx/hdrsize.log ]; then
   [ "$N" -gt 0 ] && HITS="$HITS 近${WINDOW}s hdrsize.log 命中 ${N} 条 431;"
 fi
 if [ -f /var/log/nginx/access.log ]; then
-  N=$(tail -n 500 /var/log/nginx/access.log 2>/dev/null | awk '$9 == 431' | wc -l)
-  [ "$N" -gt 0 ] && HITS="$HITS access.log 最近500条命中 ${N} 条 431;"
+  # combined 格式时间戳 [dd/Mon/yyyy:hh:mm:ss +zzzz]，仅窗口内的 431 计入（历史 431 放行）
+  N=$(tail -n 500 /var/log/nginx/access.log 2>/dev/null | awk -v now="$NOW" -v w="$WINDOW" '
+    function m2i(m,  s,p) {
+      s="Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec"; p=index(s, m)
+      return p>0 ? int((p-1)/4)+1 : 0
+    }
+    {
+      t=$4; gsub(/^\[/, "", t)
+      split(t, a, /[:\/]/)
+      e=mktime(a[3]" "m2i(a[2])" "a[1]" "a[4]" "a[5]" "a[6])
+      if (e+0 >= now-w && $9 == 431) c++
+    } END { print c+0 }')
+  [ "$N" -gt 0 ] && HITS="$HITS access.log 近${WINDOW}s 命中 ${N} 条 431;"
 fi
-if [ -f /var/log/nginx/error.log ] && grep -q "too long header line" /var/log/nginx/error.log; then
-  HITS="$HITS nginx error.log 存在 too long header line(=431);"
+if [ -f /var/log/nginx/error.log ]; then
+  # error.log 时间格式 yyyy/mm/dd hh:mm:ss（本地时区，容器为 UTC），仅窗口内的 431 类记录计入
+  N=$(grep "too long header line" /var/log/nginx/error.log 2>/dev/null | awk -v now="$NOW" -v w="$WINDOW" '
+    {
+      split($1, d, "/"); split($2, t, ":")
+      e=mktime(d[1]" "d[2]" "d[3]" "t[1]" "t[2]" "t[3])
+      if (e+0 >= now-w) c++
+    } END { print c+0 }')
+  [ "$N" -gt 0 ] && HITS="$HITS error.log 近${WINDOW}s 存在 too long header line(=431) ${N} 条;"
 fi
 if [ -n "$HITS" ]; then
   echo "[quality-gate] 拦截(高优先级 431):${HITS}"
   exit 2
 fi
-echo "[quality-gate] 通过：未发现 431"
+echo "[quality-gate] 通过：未发现窗口内 431"
 exit 0
 GEOF
 chmod 0755 "$OPS_DIR/quality_gate.sh"
@@ -705,6 +723,11 @@ REPORT="$OPS_DIR/diagnosis_report.md"
 HDRSTAT_LINE="$(grep -h 'HDRSTAT' /var/log/backend.log "$OPS_DIR/app.log" 2>/dev/null | tail -n1)"
 HDR_TOTAL="$(printf '%s' "$HDRSTAT_LINE" | sed -nE 's/.*total=([0-9]+)B.*/\1/p')"
 HDR_TOP="$(printf '%s' "$HDRSTAT_LINE" | sed -nE 's/.*max_header=([^[:space:]]+).*/\1/p')"
+# 入口实测必须取 16384B 复现探针的 request_length：报告前补发一枚该规格探针再取 hdrsize
+# 末行（直接取末行会读到预警观测探针 ~90% 阈值体量的记录，实测口径错位）
+_p="$(head -c "$TEST_HEADER_BYTES" /dev/zero | tr '\0' 'x')"
+curl ${CURL_TLS:+"$CURL_TLS"} -s -o /dev/null --max-time 15 -H "X-Debug-Trace: $_p" "$ENTRY_URL" 2>/dev/null || true
+sleep 1
 ENTRY_LEN="$(tail -n1 /var/log/nginx/hdrsize.log 2>/dev/null | awk '{print $3}')"
 [ -n "$ENTRY_LEN" ] && ENTRY_LEN="${ENTRY_LEN}B" || ENTRY_LEN="N/A"
 

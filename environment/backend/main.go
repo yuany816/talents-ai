@@ -80,7 +80,7 @@ func main() {
 	srv := &http.Server{
 		Addr:           "127.0.0.1:9000",
 		Handler:        headerQuotaMiddleware(quotaLimit, mux),
-		MaxHeaderBytes: 1 << 20, // 标准库默认值（健康）
+		MaxHeaderBytes: 16384, // 与链路追踪单个 header 上限对齐（16KiB，"刚好够用"）
 		ReadTimeout:    10 * time.Second,
 		WriteTimeout:   10 * time.Second,
 	}
