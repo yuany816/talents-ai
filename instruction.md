@@ -21,6 +21,13 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
   （经 nginx 转发后端）、`/via-gate/`（先经门禁 HTTP 预检 gate-shim（127.0.0.1:9007，
   环境自带）再转发后端）；`gate-shim` 每次预检执行 `bash /app/ops/quality_gate.sh --check`
   并映射退出码（0→放行，非 0→403 拦截，脚本缺失→403）
+- 跨层多节点（G，环境自带）：client → **edge-sim**（127.0.0.1:8080，云 LB/CDN 语义模拟：
+  单 header 行/请求行 >16KiB 或头总量 >64KiB → **恒 400，硬限制不可配置**）→
+  **mesh-sim**（127.0.0.1:8082，服务网格语义模拟：headers 总量与**个数**双重限额，
+  超限返回 **431**（Envoy HTTP/1.1 语义）；每请求注入 ~8KiB span 上下文，**不可关闭**）
+  → nginx（80）→ 后端。mesh 配置 /etc/mesh-sim/config.yaml（字段名与 Envoy 一致：
+  `max_request_headers_kb`、`max_headers_count`；修改后须 `supervisorctl restart mesh-sim`）；
+  两层各自输出逐请求判定日志（/var/log/edge-sim.log、/var/log/mesh-sim.log，含决策依据）
 - 日志轮转：/etc/logrotate.d/app 已配置（rename 轮转 access/error → *.1 → *.2，gzip 由
   运维/验题触发）；strace、logrotate 工具链镜像内自带
 
@@ -38,6 +45,14 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
      也不得显著大于 L（直连 LIM+4096 探针必须被拒 4xx——见验题契约检查 3）；
      原故障值 `8192` 不得残留于 /app/backend 的源码或配置
      （验题做字面匹配，见"验题契约"）；
+   - **网格层（mesh-sim）限额同步扩容**：`max_request_headers_kb`（headers 总量，KiB）与
+     `max_headers_count`（header 个数）**双重维度**都须与链路容量目标同步——仅修 nginx/后端
+     而网格层还是默认值（60/100）的方案判不通过（计数是与字节数独立的失败维度）；
+   - **容量评估计入 span 注入**：mesh 每请求注入 ~8KiB（真实网格行为，不可关闭），
+     全链路有效容量 = L − 注入量 − 行开销——"header 预算在链路中非单调"必须被观测并计入
+     sizing（验题有注入观测格，见检查 9）；
+   - **edge 层不可修**：云 LB 硬限制（单 header 16KiB / 头总量 64KiB → **恒 400**）——
+     容量设计必须在其约束内完成；该层错误码语义须保持（20KiB 单头经 edge 恒 400 而非 431）。
 4. **持续防线，产物落盘于 /app/ops/**：
    - `header_limits.env`：链路限额与预警参数，**必须**包含 `NGINX_LARGE_HEADER_BUFFER_BYTES`
      （nginx 侧单 header 上限，字节，须与 nginx 生效单缓冲一致）与 `WARN_RATIO`
@@ -90,6 +105,10 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
 | E 百万行阈值 5s（1 核；参考解实测 ≤2.5s） | 逐行 fork 实测百秒级；阈值含 ≥30% 余量，防评测机抖动误判 |
 | E execve 预算 ≤3 且与行数无关（1k 行 vs 1M 行相等） | 拦"逐行 fork date/awk"；strace -f -e trace=execve 实测 |
 | E 直方图 ≤200000 ns/op | O(1) 定长桶直方图实测数百 ns；只拦"每请求重扫全量"类实现 |
+| edge 硬限（单头/请求行 16KiB、头总量 64KiB → 恒 400，不可配置） | 模拟云 LB 硬限制；错误码 400 ≠ 431，跨层错误码语义差异是排查维度 |
+| mesh 计数上限（字段 max_headers_count，默认 100 → 431） | 与字节数独立的失败维度：120×100B 探针总量仅 ~14K 也被计数拒 |
+| mesh span 注入 ~8194B/请求（不可关闭） | "header 预算非单调"：全链路容量 = L − 注入 − 行开销；G 注入观测格依赖 |
+| mesh 声明一致性：max_request_headers_kb*1024 ≥ L−8192 且 max_headers_count ≥ 120 | 网格层不得成为链路容量瓶颈；配置文件即声明（与 LIM 声明一致同风格） |
 | LIM ≤4096 视为缺失 | 低于旧故障值 8192 的一半，属未有效扩容 |
 | 静默窗口 10s / 告警窗口 30s | 覆盖请求时同步写入的观测粒度加反应余量 |
 | 注入日志行格式 | 与 nginx hdrsize/error/access 日志真实格式一致（标记字段运行期随机化），用于触发门禁行为，非伪造结论 |
@@ -220,13 +239,31 @@ nginx 对无冒号坏行**容忍**（200）而 Go 拒绝（400），对 obs-fold
 对抗输入的跨层行为必须实测理解；/via-gate 的门禁预检对"日志已有 431"返回 403
 （gate-shim 调用 `--check`），对门禁自身不可用必须 **fail-closed 503**（绝不放行）。
 
-**9) 修复持久性（服务重启）**：验题会执行 `supervisorctl restart backend` 与
+**9) 跨层多节点矩阵（G：edge/mesh 语义与计数维度）**：环境含完整多节点链路
+edge-sim(:8080) → mesh-sim(:8082) → nginx(80) → 后端(:9000)，验题逐格校验：
+- **节点在线**：edge/mesh 各发一个常规请求 → 节点存活（任何 HTTP 状态码均可；
+  连接失败 000 = 不通过）；
+- **全链路 16384 探针**：经 edge 链访问 /api/v1/profile → 200（各层限额同步扩容后）；
+- **注入观测**：上述探针在 nginx hdrsize.log 的 request_length
+  ∈ [16384+8194−256, 16384+8194+4096]——mesh span 注入必须真实计入 nginx 视野
+  （容量评估未计入注入的方案此格不通过）；
+- **计数维度**：120 个 ~100B header（总量仅 ~14K）经全链路 → 200——mesh
+  max_headers_count 须同步扩容（默认 100 以 431 拒绝；计数是与字节数独立的失败维度）；
+- **全链路容量耦合**（L=你声明的单缓冲）：L−10240 探针经 edge 链 → 200
+  （nginx 视野 ≈ L−2048；mesh 限额不足时在此暴露）；
+- **edge 硬限语义（不可修层）**：单 header 20480B 经 edge → **恒 400**；90 个 ~900B
+  header（总量 ~82K）经 edge → **恒 400**——云 LB 硬限制不可配置也不可绕开，
+  错误码须保持 400（被改成 431/200 判不通过）；
+- **mesh 声明一致性**（静态，配置文件即声明）：/etc/mesh-sim/config.yaml 的
+  max_request_headers_kb*1024 ≥ L−8192 且 max_headers_count ≥ 120。
+
+**10) 修复持久性（服务重启）**：验题会执行 `supervisorctl restart backend` 与
 `supervisorctl restart nginx`（服务须按题面约定由 supervisord 管理），等待 ≤20s 至
 /healthz 恢复 200 后，复测关键探针：入口超长 header → 200、直连超长 header → 200、
 直连 LIM−2048 → 200——修复必须真实落盘于配置/源码并经服务管理生效，手工拉起的
 前台进程、改内存不改盘的方案不通过。
 
-**10) 综合分析报告与容量依据**：/app/ops/diagnosis_report.md 非空；按以下硬断言校验——
+**11) 综合分析报告与容量依据**：/app/ops/diagnosis_report.md 非空；按以下硬断言校验——
 ① 归因结论：含"归因"或"综合"；
 ② 状态码链：含"状态码链"或"修复前"，且以箭头（→）呈现分层链条；
 ③ 数值对照：同时含原故障值 `8192`、生效的新限额数值（即题面声明的 `NGINX_LARGE_HEADER_BUFFER_BYTES`）
@@ -238,7 +275,10 @@ nginx 对无冒号坏行**容忍**（200）而 Go 拒绝（400），对 obs-fold
 ⑦ 实测数值：须含对 16384B 探针的**入口实测 request_length**（nginx `$request_length` 口径，
    即完整请求行+请求头字节）：验题以自身探针的实测值 RL 为基准，报告中须存在整数
    ∈ [16403, RL+200]（16403 为行开销下限，排除 16384/THRESH/LIM 等模板数字；±200B 容差
-   覆盖头名与客户端差异）——未真实测量、只抄模板数值不通过。
+   覆盖头名与客户端差异）——未真实测量、只抄模板数值不通过；
+⑧ 多节点语义归因：须解释 edge（云 LB 硬限 → 400）与 mesh（网格语义 → 431、计数维度、
+   span 注入）的层差异——报告须同时提及 mesh/网格/边车/sidecar 与 edge/边缘/ALB/CDN，
+   且 400 与 431 两个错误码均出现并给出语义区分。
 
 **产物 schema（结构化输出契约，验题按此读取）**：
 - `/app/ops/header_limits.env`：KEY=VALUE 行；**必含** `NGINX_LARGE_HEADER_BUFFER_BYTES`
@@ -258,7 +298,8 @@ nginx 对无冒号坏行**容忍**（200）而 Go 拒绝（400），对 obs-fold
   ns/op、阈值与实测的余量比、以及 header 上限 L 的取值论证（跳数增长模型）；
 - `/app/ops/diagnosis_report.md`：Markdown；必含 ①各层状态码链（修复前/分层修复后）
   ②限额修改前后对照（含具体数值）③"归因/综合"结论 ④容量取值依据（"余量"或"sizing"）
-  ⑤入口实测 request_length 数值（见检查 10⑦）。
+  ⑤入口实测 request_length 数值（见检查 11⑦）⑥多节点语义归因（edge/mesh 层差异与
+  400/431 区分，见检查 11⑧）。
 
 ## 约束
 - 不要硬编码"通过"结果；修复必须真实生效于配置与源码（验题按上文判定范围检查）；
@@ -276,6 +317,11 @@ nginx 对无冒号坏行**容忍**（200）而 Go 拒绝（400），对 obs-fold
   注意甄别看起来相关、但实际未被代码读取的历史配置与环境变量；
 - /direct、/via-backend、/via-gate 三条路径是理解"每层判定语义"的探针：同一请求在
   不同路径的响应码差异就是各层语义差异；
+- edge(:8080)/mesh(:8082) 两个节点有各自的逐请求判定日志（/var/log/edge-sim.log、
+  /var/log/mesh-sim.log）：同一请求经不同节点入口的响应码差异就是各层语义差异
+  （400=云 LB 硬限、431=网格语义、431-计数=header 个数维度）；mesh 的 span 注入是
+  不可关闭的真实网格行为——nginx/后端看到的 header 比客户端原始请求多 ~8KiB，
+  容量评估与观测口径都必须计入；
 - 断点续读的关键在轮转瞬间的窗口：rename 后旧文件可能仍有未读增量——先读完旧 fd 到
   EOF（或按已计 offset 处理轮转产物），再打开新文件；用 inode 而非文件名判断身份；
 - 修完别忘了"预防复发"：能提前感知逼近阈值的请求，并在变更质检中把 431 当作高优先级拦截项；
