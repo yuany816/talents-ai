@@ -41,7 +41,7 @@ NG_CHB_KB=16                 # L1: client_header_buffer_size
 NG_BUF_N=16                  # L1: large_client_header_buffers 数量
 NG_BUF_KB=64                 # L1: large_client_header_buffers 单缓冲（单行 header 上限）
 APP_FASTHTTP_BUF=1048576     # L2: fasthttp/fiber ReadBufferSize
-APP_NETHTTP_MAX=4194304      # L2: net/http MaxHeaderBytes
+APP_NETHTTP_MAX=$(( NG_BUF_KB * 1024 ))  # L2: net/http MaxHeaderBytes（L3: 三层统一 == L）
 WARN_RATIO=80                # 预警阈值 = 上限的 80%
 WARN_THRESHOLD=$(( NG_BUF_KB * 1024 * WARN_RATIO / 100 ))   # 预警绝对阈值（字节），注入观测中间件
 
@@ -52,7 +52,7 @@ APPLIED_APP_LIMIT=0; SOURCE_CHANGED=0; CONFIG_CHANGED=0
 EDITED_FILES=""; MAIN_GO_FILES=""; NG_LOGS=""
 NG_CHB_BEFORE="未配置(默认1k)"; NG_BUF_BEFORE="未配置(默认4 8k)"
 APP_LIMIT_BEFORE="未知"; APP_KIND=""; WIRE_FILE=""; MID_FILE=""; MID_WIRED=0
-APP_QUOTA_MAX=1048576; QUOTA_APPLIED=0; QUOTA_BEFORE=""
+APP_QUOTA_MAX=$(( NG_BUF_KB * 1024 )); QUOTA_APPLIED=0  # L3: 业务配额 == L（单一事实来源）
 
 say()  { echo "[solve.sh] $*"; }
 warn() { echo "[solve.sh][WARN] $*" >&2; }

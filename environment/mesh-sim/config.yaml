@@ -1,0 +1,4 @@
+# 网格边车 header 限额（Envoy 风格字段名；2023 年按当时体量设定）
+# 修改后需 supervisorctl restart mesh-sim 生效
+max_request_headers_kb: 60
+max_headers_count: 100
