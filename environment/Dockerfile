@@ -9,6 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN mkdir -p /app /logs/verifier /var/log/nginx /var/log/supervisor
 
+# 环境版本戳：验题日志读取它以自证环境镜像未被平台缓存复用（换版本时同步改 v 标记）
+RUN echo "task431-env v3 $(date -u +%FT%TZ)" > /app/.task_build_stamp
+
 # Go 后端源码（含故障：业务配额限额过小），并预编译出可运行二进制
 COPY backend /app/backend
 RUN cd /app/backend && GOFLAGS=-mod=mod GOPROXY=off CGO_ENABLED=0 go build -o backend .

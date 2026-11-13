@@ -10,6 +10,12 @@
 # （全过 exit 0 / 任一失败 exit 1），最终判定仍以 reward.txt 为准。
 REWARD_FILE="/logs/verifier/reward.txt"
 mkdir -p /logs/verifier /var/log/nginx
+# 版本自证：trial 日志与 /logs/verifier/version.txt 明示本次验题契约版本与环境构建戳，
+# 用于排查平台侧旧包/旧镜像缓存（若 trial 日志无此行，说明平台未运行当前 test.sh）
+CONTRACT_VERSION="431-contract-v3.1 (repo 27bb98b, 2026-11-13)"
+echo "[verifier] contract=$CONTRACT_VERSION"
+printf '%s\n' "$CONTRACT_VERSION" > /logs/verifier/version.txt 2>/dev/null || true
+[ -f /app/.task_build_stamp ] && echo "[verifier] env_build=$(cat /app/.task_build_stamp 2>/dev/null)"
 PASS=1
 ok()   { echo "[verifier] ok   : $1"; }
 fail() { echo "[verifier] FAIL : $1"; PASS=0; }
