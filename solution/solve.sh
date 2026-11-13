@@ -519,6 +519,26 @@ else
   say ">> 后端限额已调至 框架层=${APPLIED_APP_LIMIT}B / 业务配额=${_qlim}B（修改:$EDITED_FILES）"
 fi
 
+# ---------- 步骤④.7：网格层（mesh-sim）限额同步扩容（G 矩阵：总量+计数双维度） ----------
+say "步骤④.7：mesh-sim 限额同步扩容（max_request_headers_kb / max_headers_count）"
+MESH_CONF="/etc/mesh-sim/config.yaml"
+MESH_TOTAL_KB=$(( NG_BUF_KB + 64 ))   # 须 ≥ L−8192（mesh 自身注入 ~8KiB + 网格不得成为瓶颈）
+MESH_COUNT=256                        # 须 ≥ 120（计数维度：120×100B 探针）
+if [ -f "$MESH_CONF" ]; then
+  MESH_BEFORE="$(grep -E 'max_request_headers_kb|max_headers_count' "$MESH_CONF" | tr -s ' \n' ' ')"
+  backup "$MESH_CONF"
+  sed -i -E "s/^([[:space:]]*max_request_headers_kb[[:space:]]*:[[:space:]]*)[0-9]+/\1${MESH_TOTAL_KB}/;
+             s/^([[:space:]]*max_headers_count[[:space:]]*:[[:space:]]*)[0-9]+/\1${MESH_COUNT}/" "$MESH_CONF"
+  say "mesh 修改前: ${MESH_BEFORE:-无}"
+  if command -v supervisorctl >/dev/null 2>&1 && supervisorctl status >/dev/null 2>&1; then
+    timeout 60 supervisorctl restart mesh-sim >/dev/null 2>&1 || warn "mesh-sim 重启失败（请人工检查）"
+    sleep 1
+  fi
+  say "mesh 修改后: $(grep -E 'max_request_headers_kb|max_headers_count' "$MESH_CONF" | tr -s ' \n' ' ')"
+else
+  warn "未找到 $MESH_CONF（环境无 mesh-sim 节点？跳过网格层扩容）"
+fi
+
 # ---------- 步骤⑤：重新编译打包 ----------
 NEW_BIN=""
 if [ "$SOURCE_CHANGED" = "1" ]; then
@@ -616,6 +636,8 @@ NGINX_CLIENT_HEADER_BUFFER_BYTES=$(( NG_CHB_KB * 1024 ))
 NGINX_LARGE_HEADER_BUFFER_COUNT=${NG_BUF_N}
 NGINX_LARGE_HEADER_BUFFER_BYTES=$(( NG_BUF_KB * 1024 ))
 APP_MAX_HEADER_BYTES=$(( QUOTA_APPLIED == 1 ? APP_QUOTA_MAX : APPLIED_APP_LIMIT ))
+MESH_MAX_REQUEST_HEADERS_KB=${MESH_TOTAL_KB}
+MESH_MAX_HEADERS_COUNT=${MESH_COUNT}
 WARN_RATIO=${WARN_RATIO}
 ENTRY_URL=${ENTRY_URL}
 UPSTREAM_URL=${UPSTREAM_URL}
@@ -627,47 +649,125 @@ EOF
 
 cat > "$OPS_DIR/quality_gate.sh" <<'GEOF'
 #!/bin/bash
-# 变更质检门禁：431 为高优先级拦截项（仅拦时间窗内的 431；历史记录不误拦）
-# 用法：bash /app/ops/quality_gate.sh  →  exit 0 通过 / exit 2 拦截
+# 变更质检门禁（L3 多模式）：
+#   quality_gate.sh            等价 --check：无状态窗口检查（L2 语义，/via-gate 预检用）
+#   quality_gate.sh --check    同上
+#   quality_gate.sh --replay [file]
+#                              断点续读：按 gate_state.json 的 (inode,offset) 消费增量；
+#                              rename 轮转产物（*.1/*.2/*.gz）按 inode/名称迁移续读，
+#                              gzip 流式解压不落盘；truncate 从 0 重读不重复计数；
+#                              事件时间窗 1h（窗外事件跳过）；状态原子写（tmp+rename）。
+# 退出：--check 0 通过 / 2 拦截；--replay 0 成功 / 非 0 处理故障。
 set -u
-WINDOW=${GATE_WINDOW_SECONDS:-300}
-NOW=$(date +%s); HITS=""
+umask 022
+export LC_ALL=C
+STATE=/app/ops/gate_state.json
+WINDOW=${GATE_WINDOW_SECONDS:-600}
+NOW=${EPOCHSECONDS:-0}
+MODE=check; BENCH_FILE=""
+case "${1:-}" in
+  --check) MODE=check ;;
+  --replay) MODE=replay; BENCH_FILE="${2:-}" ;;
+esac
 
-if [ -f /var/log/nginx/hdrsize.log ]; then
-  N=$(awk -v now="$NOW" -v w="$WINDOW" '$1+0 >= now-w && $2 == 431' /var/log/nginx/hdrsize.log | wc -l)
-  [ "$N" -gt 0 ] && HITS="$HITS 近${WINDOW}s hdrsize.log 命中 ${N} 条 431;"
-fi
-if [ -f /var/log/nginx/access.log ]; then
-  # combined 格式时间戳 [dd/Mon/yyyy:hh:mm:ss +zzzz]，仅窗口内的 431 计入（历史 431 放行）
-  N=$(tail -n 500 /var/log/nginx/access.log 2>/dev/null | awk -v now="$NOW" -v w="$WINDOW" '
-    function m2i(m,  s,p) {
-      s="Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec"; p=index(s, m)
-      return p>0 ? int((p-1)/4)+1 : 0
-    }
-    {
-      t=$4; gsub(/^\[/, "", t)
-      split(t, a, /[:\/]/)
-      e=mktime(a[3]" "m2i(a[2])" "a[1]" "a[4]" "a[5]" "a[6])
-      if (e+0 >= now-w && $9 == 431) c++
-    } END { print c+0 }')
-  [ "$N" -gt 0 ] && HITS="$HITS access.log 近${WINDOW}s 命中 ${N} 条 431;"
-fi
-if [ -f /var/log/nginx/error.log ]; then
-  # error.log 时间格式 yyyy/mm/dd hh:mm:ss（本地时区，容器为 UTC），仅窗口内的 431 类记录计入
-  N=$(grep "too long header line" /var/log/nginx/error.log 2>/dev/null | awk -v now="$NOW" -v w="$WINDOW" '
-    {
-      split($1, d, "/"); split($2, t, ":")
-      e=mktime(d[1]" "d[2]" "d[3]" "t[1]" "t[2]" "t[3])
-      if (e+0 >= now-w) c++
-    } END { print c+0 }')
-  [ "$N" -gt 0 ] && HITS="$HITS error.log 近${WINDOW}s 存在 too long header line(=431) ${N} 条;"
-fi
-if [ -n "$HITS" ]; then
-  echo "[quality-gate] 拦截(高优先级 431):${HITS}"
-  exit 2
-fi
-echo "[quality-gate] 通过：未发现窗口内 431"
-exit 0
+sget() {  # sget <source-key> <field> → 值（缺失为 0）
+  [ -f "$STATE" ] || { echo 0; return; }
+  grep -o "\"$1\":{[^}]*}" "$STATE" 2>/dev/null | grep -o "\"$2\":[0-9-]*" | grep -o -- "-\?[0-9]*$" | head -n1
+}
+
+check_mode() {  # 无状态窗口检查（L2 兼容语义）
+  local HITS="" N
+  if [ -f /var/log/nginx/hdrsize.log ]; then
+    N=$(awk -v now="$NOW" -v w="$WINDOW" '$1+0>=now-w && $2==431' /var/log/nginx/hdrsize.log | wc -l)
+    [ "$N" -gt 0 ] && HITS="$HITS hdrsize:${N};"
+  fi
+  if [ -f /var/log/nginx/access.log ]; then
+    N=$(tail -n 2000 /var/log/nginx/access.log 2>/dev/null | awk -v now="$NOW" -v w="$WINDOW" '
+      function m2i(m,s,p){s="Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec";p=index(s,m);return p>0?int((p-1)/4)+1:0}
+      {t=$4;gsub(/^\[/,"",t);split(t,a,/[:\/]/);e=mktime(a[3]" "m2i(a[2])" "a[1]" "a[4]" "a[5]" "a[6]);
+       if(e+0>=now-w && $9==431)c++} END{print c+0}')
+    [ "$N" -gt 0 ] && HITS="$HITS access:${N};"
+  fi
+  if [ -f /var/log/nginx/error.log ]; then
+    N=$(grep "too long header line" /var/log/nginx/error.log 2>/dev/null | awk -v now="$NOW" -v w="$WINDOW" '
+      {split($1,d,"/");split($2,t,":");e=mktime(d[1]" "d[2]" "d[3]" "t[1]" "t[2]" "t[3]);
+       if(e+0>=now-w)c++} END{print c+0}')
+    [ "$N" -gt 0 ] && HITS="$HITS error:${N};"
+  fi
+  if [ -n "$HITS" ]; then echo "[quality-gate] 拦截(窗口内 431):${HITS}"; return 2; fi
+  echo "[quality-gate] 通过：窗口内无 431"; return 0
+}
+
+# 单文件流式解析：fmt=access(ts=$4 combined,status=$9) / error(ts=$1 $2,标记行) / hdrsize(ts=$1,status=$2)
+# 输出：新增 431 计数；skip 字节前的内容跳过（断点续读）
+stream_count() {  # stream_count <file> <fmt> <skip>
+  zcat -f "$1" 2>/dev/null | tail -c "+$(( $3 + 1 ))" | awk -v fmt="$2" -v now="$NOW" -v w="$WINDOW" '
+    function m2i(m,s,p){s="Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec";p=index(s,m);return p>0?int((p-1)/4)+1:0}
+    fmt=="hdrsize" { if ($1+0>=now-w && $2==431) c++; next }
+    fmt=="error"   { if ($0 !~ /too long header line/) next;
+                     split($1,d,"/");split($2,t,":");e=mktime(d[1]" "d[2]" "d[3]" "t[1]" "t[2]" "t[3]);
+                     if(e+0>=now-w)c++; next }
+    { t=$4;gsub(/^\[/,"",t);split(t,a,/[:\/]/);e=mktime(a[3]" "m2i(a[2])" "a[1]" "a[4]" "a[5]" "a[6]);
+      if(e+0>=now-w && $9==431)c++ }
+    END{print c+0}'
+}
+
+replay_mode() {  # 断点续读
+  local rc=0 base ino sz off cnt tot_art n key fi
+  local tmp="$STATE.tmp$$"
+  declare -A RI RO      # rotated: name→inode/offset（运行期账本，落盘回写）
+  # 载入已有 rotated 条目（name 无 .gz 后缀）
+  if [ -f "$STATE" ]; then
+    while IFS= read -r k; do
+      RI["$k"]=$(grep -o "\"$k\":{[^}]*}" "$STATE" | grep -o "\"inode\":[0-9]*" | grep -o "[0-9]*$")
+      RO["$k"]=$(grep -o "\"$k\":{[^}]*}" "$STATE" | grep -o "\"offset\":[0-9]*" | grep -o "[0-9]*$")
+    done < <(grep -o '"rotated":{[^}]*}' "$STATE" 2>/dev/null | grep -oE '"/var/log/nginx/[^"]*"' | tr -d '"' | tr '\n' ' ')
+  fi
+  for base in /var/log/nginx/access.log /var/log/nginx/error.log /var/log/nginx/hdrsize.log; do
+    fmt=access; [ "${base##*/}" = "error.log" ] && fmt=error; [ "${base##*/}" = "hdrsize.log" ] && fmt=hdrsize
+    off=$(sget "${base}" offset); cnt=$(sget "${base}" count_431); ino=$(sget "${base}" inode)
+    # 轮转产物：最旧在前（*.2.gz/*.2 → *.1.gz/*.1）
+    for f in "$base.2.gz" "$base.2" "$base.1.gz" "$base.1"; do
+      [ -f "$f" ] || continue
+      key=${f%.gz}
+      if [ -z "${RO[$key]:-}" ]; then
+        fi=$(stat -c %i "$f" 2>/dev/null || echo 0)
+        if [ "$fi" = "$ino" ]; then off=$off   # 轮转前的"当前文件"→ 以源 offset 续读（不丢不重）
+        else off=0; fi                         # 未知产物：从头（其内容未被计数过）
+        RI["$key"]=$fi; RO["$key"]=0
+      fi
+      n=$(stream_count "$f" "$fmt" "${RO[$key]}") || rc=1
+      cnt=$(( cnt + n ))
+      tot_art=$(( RO[$key] + $(stat -c %s "$f") ))
+      RO["$key"]=$(( RO[$key] + $(zcat -f "$f" 2>/dev/null | wc -c) ))
+    done
+    # 当前文件
+    if [ -f "$base" ]; then
+      fi=$(stat -c '%i %s' "$base"); in=${fi%% *}; sz=${fi##* }
+      if [ "$in" = "$ino" ]; then
+        [ "$sz" -lt "${off:-0}" ] && off=0     # truncate：从 0 重读，已计不重
+      else
+        off=0; ino=$in                          # 新文件（轮转/重建）
+      fi
+      n=$(stream_count "$base" "$fmt" "${off:-0}") || rc=1
+      cnt=$(( cnt + n )); off=$(( ${off:-0} + $(tail -c "+$(( ${off:-0} + 1 ))" "$base" 2>/dev/null | wc -c) ))
+    fi
+    NKEY="${base//\//\\/}"
+    printf -v SJ '%s "%s":{"inode":%d,"offset":%d,"count_431":%d},' "$SJ" "$base" "$ino" "$off" "$cnt"
+  done
+  RJSON=""
+  for k in "${!RO[@]}"; do printf -v RJSON '%s"%s":{"inode":%d,"offset":%d},' "$RJSON" "$k" "${RI[$k]}" "${RO[$k]}"; done
+  RJSON=${RJSON%,}
+  SJ=${SJ%,}
+  { printf '{"version":1,"window":%d,"sources":{%s},"rotated":{%s}}\n' "$WINDOW" "${SJ:-}" "$RJSON" > "$tmp"; } && mv -f "$tmp" "$STATE" || rc=1
+  return $rc
+}
+
+case "$MODE" in
+  check)  check_mode; exit $? ;;
+  replay) [ -n "$BENCH_FILE" ] && { [ -f "$BENCH_FILE" ] || exit 3; n=$(stream_count "$BENCH_FILE" access 0); echo "[quality-gate] bench: 窗口内 431 = $n"; exit 0; }
+          replay_mode; exit $? ;;
+esac
 GEOF
 chmod 0755 "$OPS_DIR/quality_gate.sh"
 
@@ -688,11 +788,21 @@ say "常规请求(入口)      : ${BASELINE:-无响应}"
 say "超长header(入口)    : ${FINAL:-无响应}  （修复前=${INITIAL} / L1后=${AFTER_NGINX}）"
 say "超长header(直达后端): ${DIRECT:-跳过}"
 
+# 全链路（edge→mesh→nginx→后端）验证：G 矩阵（16384 探针 + 120×100B 计数探针）
+EDGE_URL="http://127.0.0.1:8080/api/v1/profile"
+EDGE_FINAL="$(probe "$EDGE_URL" "$TEST_HEADER_BYTES")"
+CNT_ARGS=""; for n in $(seq 0 119); do CNT_ARGS="$CNT_ARGS -H X-Vrf-Cnt-$n:$(printf 'c%.0s' $(seq 1 100))"; done
+EDGE_COUNT="$(curl ${CURL_TLS:+"$CURL_TLS"} -s -o /dev/null -w '%{http_code}' --max-time 15 $CNT_ARGS "$EDGE_URL" 2>/dev/null)"
+say "超长header(全链路 edge 链): ${EDGE_FINAL:-无响应}（mesh 注入 ~8KiB 计入 nginx 视野）"
+say "计数探针(全链路 120×100B)  : ${EDGE_COUNT:-无响应}（mesh max_headers_count 须 ≥120）"
+
 PASS=1
 case "$BASELINE" in ""|000) PASS=0;; esac
 case "$FINAL"   in ""|000|431|414|5??) PASS=0;; esac
 [ -n "$BASELINE" ] && [ "$BASELINE" != "$FINAL" ] && PASS=0
 case "$DIRECT"  in 431|414|000) PASS=0;; esac
+case "$EDGE_FINAL" in 200) : ;; *) PASS=0;; esac   # 全链路须 200（400=某层仍拒，431=网格层未扩容）
+case "$EDGE_COUNT" in 200) : ;; *) PASS=0;; esac
 
 GATE_RC=0
 bash "$OPS_DIR/quality_gate.sh" || GATE_RC=$?
@@ -742,6 +852,8 @@ ROW_QUOTA=""
 if [ "$QUOTA_APPLIED" = "1" ]; then
   ROW_QUOTA="| L2 | ${APP_LABEL}（业务配额中间件，启动时从配置加载） | max_header_bytes | ${QUOTA_BEFORE:-?} | ${APP_QUOTA_MAX} |"
 fi
+ROW_MESH="| G | mesh-sim（服务网格语义模拟，Envoy 风格字段） | max_request_headers_kb / max_headers_count | ${MESH_BEFORE:-60 / 100（默认）} | ${MESH_TOTAL_KB:-N/A} / ${MESH_COUNT:-N/A} |"
+ROW_EDGE="| G | edge-sim（云 LB/CDN 语义模拟） | 单 header 值/请求行/头总量 | 硬限制 16KiB / 16KiB / 64KiB | **不可配置**（超限恒 400，非 431） |"
 
 if [ -n "$HDR_TOP" ]; then
   ATTR_DETAIL="- 逐 header 归因（后端 HDRSTAT 中间件）：请求头总长 ${HDR_TOTAL:-?}B，单个最大 header 为 ${HDR_TOP} —— 注入该 header 的上游模块（网关/认证/链路追踪等）是 header 体量增长的主要来源"
@@ -766,6 +878,8 @@ cat > "$REPORT" <<EOF
 | L1 | nginx（入口反代） | large_client_header_buffers | ${NG_BUF_BEFORE} | ${NG_BUF_N} ${NG_BUF_KB}k |
 | L2 | ${APP_LABEL} | ${L2_KEY} | ${APP_LIMIT_BEFORE} | ${APPLIED_APP_LIMIT} |
 ${ROW_QUOTA}
+${ROW_MESH}
+${ROW_EDGE}
 
 结论：修复前 nginx 与后端两层阈值均低于上游注入的 header 体量（复现探针 ${TEST_HEADER_BYTES}B），属多模块限制过小。
 
@@ -778,6 +892,7 @@ ${ATTR_DETAIL}
 2. 仅修 L1 后入口仍为 ${AFTER_NGINX}（见状态码链），证明单点修复不充分，必须端到端协同治理；
 3. 修复后余量：nginx 单行上限 $(( NG_BUF_KB * 1024 ))B、后端 ${APPLIED_APP_LIMIT}B，均远高于实测体量；
 4. 持续防线：${WARN_RATIO}% 阈值预警 watchdog → warnings.log（431 触发前感知）；quality_gate.sh 对 431 高优先级拦截（exit 2）；阈值单一事实来源 header_limits.env。
+5. 多节点语义（edge/mesh）：mesh 每请求注入 ~8KiB span 上下文（不可关闭）——全链路有效容量 = nginx 单缓冲 − 注入 − 行开销，容量评估计入注入体量；edge 为云 LB 硬限（单头 16KiB/总量 64KiB → 恒 400），错误码语义必须区分：400 = ALB 硬限、431 = 网格/后端语义拒绝；mesh 计数维度（max_headers_count）与字节数独立，120×100B 请求仅 ~14K 也会被计数拒绝。
 
 ## 5. 证据与产物
 - 复验记录：/app/ops/last_solve_result.txt
@@ -795,6 +910,9 @@ final_status=${FINAL}
 direct_status=${DIRECT}
 app_max_header_bytes=${APPLIED_APP_LIMIT}
 nginx_large_header_buffers=${NG_BUF_N}x$(( NG_BUF_KB * 1024 ))B
+mesh_limits=${MESH_TOTAL_KB:-NA}KB/${MESH_COUNT:-NA}count
+edge_final=${EDGE_FINAL:-NA}
+edge_count=${EDGE_COUNT:-NA}
 quality_gate_exit=${GATE_RC}
 report=diagnosis_report.md
 app_kind=${APP_KIND}

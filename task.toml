@@ -2,7 +2,7 @@ schema_version = "1.3"
 
 [task]
 name = "humanlaya/coding-task"
-version = "2.0"        # 契约 v4.0-L3（C+E+F）：平台侧以此区分任务包缓存；stdout 首行 contract= 自证
+version = "2.1"        # G 多节点（edge/mesh 语义模拟 + 计数维度 + span 注入）        # 契约 v4.0-L3（C+E+F）：平台侧以此区分任务包缓存；stdout 首行 contract= 自证
 
 [agent]
 timeout_sec = 21600        # L3：C(断点续读)+E(性能)+F(跨层矩阵) 人类参考工时 4-6h

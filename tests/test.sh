@@ -330,15 +330,18 @@ cnt_args=()
 for n in $(seq 0 119); do cnt_args+=(-H "X-Vrf-Cnt-$n: $(printf 'c%.0s' $(seq 1 100))"); done
 g2=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${cnt_args[@]}" "$EDGE/api/v1/profile")
 [ "$g2" = "200" ] && ok "计数探针（120×100B，总量~14K）全链路 → 200" || fail "计数维度未放行（120 header → $g2；mesh max_headers_count 须同步扩容）"
-# G3 全链路容量耦合（LIM 基准）：mesh 注入吃掉 ~8KiB 预算——全链路容量 = L − 注入 − 行开销，
-# LIM−10240 探针（nginx 视野 ≈ LIM−2048 < LIM）必须 200
-g3=""; g3sz=0
+# G3 全链路容量耦合（LIM 基准）：mesh 注入吃掉 ~8KiB 预算——全链路容量 = L − 注入 − 行开销。
+# 多头探针：5×((LIM−10240)/5)（每头 ≤16KiB 以通过 edge 单头硬限——单头 16K 硬限下
+# 全链路容量本就必须多头承载），nginx 视野 ≈ LIM−2048 < LIM，必须 200
+g3=""
 if [ -n "$LIM" ] && [ "$LIM" -gt 30720 ] && [ "$LIM" -le 1048576 ]; then
-  g3sz=$(( LIM - 10240 ))
+  g3sz=$(( (LIM - 10240) / 5 ))
   gp=$(head -c $g3sz /dev/zero | tr '\0' 'x')
-  g3=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "${VHDR}: $gp" "$EDGE/api/v1/profile")
-  [ "$g3" = "200" ] && ok "全链路容量耦合（LIM−10240 经 edge 链）→ 200" \
-    || fail "全链路容量缺口：LIM−10240 经 edge 链 → $g3（mesh 限额须 ≥ LIM−8192，nginx 视野含注入体量）"
+  g3args=()
+  for n in 0 1 2 3 4; do g3args+=(-H "X-Vrf-Cap-$n: $gp"); done
+  g3=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${g3args[@]}" "$EDGE/api/v1/profile")
+  [ "$g3" = "200" ] && ok "全链路容量耦合（5×(LIM−10240)/5 经 edge 链）→ 200" \
+    || fail "全链路容量缺口：5×(LIM−10240)/5 经 edge 链 → $g3（mesh 限额须 ≥ LIM−8192，nginx 视野含注入体量）"
 fi
 # G4 edge 硬限语义（不可修层，恒 400）：单 header 20480B > 16384B 硬限 → 恰好 400（非 431）
 g4=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "${VHDR}: $(head -c 20480 /dev/zero | tr '\0' 'x')" "$EDGE/api/v1/profile")
