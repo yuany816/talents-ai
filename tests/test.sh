@@ -21,6 +21,21 @@ big=$(head -c $PROBE_BYTES /dev/zero | tr '\0' 'x')
 # ---------- 0) 环境在线 ----------
 curl -s -o /dev/null --max-time 5 "$ENTRY/" || fail "入口不可达"
 curl -s -o /dev/null --max-time 5 "$UP/" || fail "后端不可达"
+# 中间层与 Kafka 为环境组成部分（防"删除组件降噪"与端口占位桩）：
+# /componentz 由组件本地应答、携带组件名指纹；kafka 为 JVM 慢启组件，探活带 3×2s 重试。
+TG="http://127.0.0.1:9100"; MS="http://127.0.0.1:15001"
+curl -s -o /dev/null --max-time 5 "$TG/componentz" || fail "tracegate(9100) 不可达"
+curl -s -o /dev/null --max-time 5 "$MS/componentz" || fail "meshd(15001) 不可达"
+curl -s --max-time 5 "$TG/componentz" | grep -q '"tracegate"' \
+  && ok "tracegate(9100) 组件指纹匹配" || fail "9100 非预期服务（缺 tracegate 组件指纹）"
+curl -s --max-time 5 "$MS/componentz" | grep -q '"meshd"' \
+  && ok "meshd(15001) 组件指纹匹配" || fail "15001 非预期服务（缺 meshd 组件指纹）"
+kafka_ok=0
+for _ in 1 2 3; do
+  if timeout 3 bash -c 'exec 3<> /dev/tcp/127.0.0.1/9092' 2>/dev/null; then kafka_ok=1; break; fi
+  sleep 2
+done
+[ "$kafka_ok" = "1" ] && ok "kafka(9092) 端口在线" || fail "kafka(9092) 不可达"
 
 # ---------- 1) 端到端：超长 header 与常规请求行为一致（多路由/多层） ----------
 entry_big=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "X-Verify-Token: $big" "$ENTRY/api/v1/profile")
@@ -33,14 +48,21 @@ direct=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "X-Verify-Token
 [ "$direct" = "200" ] && ok "直连后端超长header → 200" || fail "直连后端超长header → $direct"
 srv=$(curl -s -D - -o /dev/null --max-time 10 "$ENTRY/api/v1/profile" | grep -i '^server:' | head -n1)
 echo "$srv" | grep -qi nginx && ok "入口为 nginx 反代" || fail "入口响应缺 Server: nginx"
-# 链路完整性（防"绕过中间层直连下游"式伪修复）：入口请求经 tracegate/meshd 注入链
-# 后由后端回显 X-Trace-Context——响应头须同时含 gate= 与 mesh= 注入段。
-# 若中间层被绕开或注入/回显被拆除，该头缺失或缺少对应段。
-tc_hdr=$(curl -s -D - -o /dev/null --max-time 10 "$ENTRY/api/v1/profile" | grep -i '^x-trace-context:' | head -n1)
-if echo "$tc_hdr" | grep -q 'gate=' && echo "$tc_hdr" | grep -q 'mesh='; then
-  ok "注入链完整（X-Trace-Context 含 gate/mesh 注入段）"
+# 链路完整性（防"绕过中间层直连下游"与"静态伪造注入段"式伪修复）：验题注入一次性
+# nonce，后端回显的 X-Trace-Context 须按序包含 nonce→gate=→mesh=（真实注入为顺序
+# 追加），且回显值较 nonce 增幅 ≥2048B（gate/mesh span 真实落头）。静态 add_header
+# 无法预知 nonce；绕过中间层则无注入段。
+VFY="vfy$(date +%s%N)"
+tc_val=$(curl -s -D - -o /dev/null --max-time 10 -H "X-Trace-Context: $VFY" "$ENTRY/api/v1/profile" \
+  | grep -i '^x-trace-context:' | head -n1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/\r$//')
+case "$tc_val" in
+  *"$VFY"*"gate="*"mesh="*) ok "注入链完整（X-Trace-Context 回显 nonce→gate→mesh 有序追加）" ;;
+  *) fail "注入链不完整或伪造（回显缺 nonce/gate=/mesh= 有序段——疑似绕过中间层）" ;;
+esac
+if [ "${#tc_val}" -ge $(( ${#VFY} + 2048 )) ]; then
+  ok "注入链增幅达标（回显 ${#tc_val}B，span 追加 ≥2048B）"
 else
-  fail "注入链不完整（响应缺 X-Trace-Context 或缺 gate/mesh 注入段——疑似绕过中间层）"
+  fail "注入链增幅不足（回显 ${#tc_val}B，gate/mesh span 未真实落头）"
 fi
 # 响应体特征（防"桩替换"式作弊：必须是真实应用在服务，而非只回 200 的替身）
 body=$(curl -s --max-time 10 "$ENTRY/api/v1/profile")
@@ -69,6 +91,19 @@ if grep -rqIE '(^|[^0-9])8192([^0-9]|$)|(MaxHeaderBytes|max_header_bytes)["'\'':
 else
   ok "后端侧 header 限额已真实调整（源码/配置扫描）"
 fi
+# 中间层组件限额为配置驱动（进程启动时读取），同机制镜像扫描（键上下文锚定，
+# 不误伤无关数值；行为探针为主要判定，扫描为辅助证据）。
+scan_fault() {  # $1=故障值 $2=目录 $3=标签
+  if grep -rqIE "max_header_bytes[\"':= ]*$1([^0-9]|$)" "$2" \
+      --exclude='*.bak' --exclude='*.bak.*' --exclude='*.candbak' --exclude='*.orig' \
+      --exclude='*.old' --exclude='*.backup' --exclude='*.disabled' 2>/dev/null; then
+    fail "$3 侧 header 限额仍残留原故障值 $1（max_header_bytes 键上下文，源码/配置）"
+  else
+    ok "$3 侧 header 限额已真实调整（源码/配置扫描）"
+  fi
+}
+scan_fault 10240 /app/tracegate tracegate
+scan_fault 12288 /app/mesh meshd
 
 # ---------- 3) 边界与输入覆盖（以解题者声明的限额为基准） ----------
 LIMENV="/app/ops/header_limits.env"
@@ -181,6 +216,9 @@ if [ -s "$RPT" ]; then
     && ok "报告含实质归因（量化证据+两侧归因）" || fail "报告缺实质归因（量化证据/注入侧/限制侧）"
   grep -qiE '余量|sizing' "$RPT" \
     && ok "报告含容量取值依据（增长余量/sizing）" || fail "报告缺容量取值依据（余量/sizing）"
+  # ⑦ 中间层限额对照：报告须覆盖 tracegate/meshd 的原故障值与新值
+  grep -q '10240' "$RPT" && grep -q '12288' "$RPT" \
+    && ok "报告含 tracegate/meshd 层限额对照（10240/12288）" || fail "报告缺 tracegate/meshd 层限额数值对照"
 else
   fail "缺少综合分析报告 /app/ops/diagnosis_report.md"
 fi

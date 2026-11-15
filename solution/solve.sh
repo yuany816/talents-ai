@@ -2,27 +2,33 @@
 # =============================================================================
 # solution/solve.sh —— Harbor 参考解（标准答案脚本，agent 不可见，仅供平台验题）
 #
-# 任务场景：入口 nginx 反代 + Go 后端（同容器）。超长请求头触发
-#           431 Request Header Fields Too Large，故障在两层：
-#             L1 nginx：client_header_buffer_size / large_client_header_buffers 过小
-#             L2 Go 框架：fasthttp/fiber ReadBufferSize 或 net/http MaxHeaderBytes 过小
-#                        （L1 修复后依旧 431，需改源码并重新编译打包）
+# 任务场景：五层链路（同步）+ 异步审计旁路。超长请求头触发 431 Request Header
+#           Fields Too Large，同步链路故障在四层：
+#             L1 nginx：snippets/headers.conf 缓冲过小（8k / 4 16k）
+#             L2 tracegate：接入网关 trace 插件 header 预算过小（10240，配置驱动）
+#             L3 meshd：mesh 数据面 sidecar max_header_bytes 过小（12288，配置驱动）
+#             L4 backend：net/http MaxHeaderBytes(1<<13) + go:embed 固化的业务配额(8192)
+#                        （需改源码/配置并重新编译打包）
+#           异步旁路：backend → Kafka(message.max.bytes=16384 过小) → trace-collector；
+#           审计事件携带全量请求头快照，超限被拒（MESSAGE_TOO_LARGE）——与同步 431
+#           无关，属排查噪声与容量信号，本脚本一并治理（非奖励项）。
 #           注意：实测 nginx 1.22 对超长 header 行回 400 "Request Header Or Cookie
-#           Too Large"（且属 info 级日志，默认 error 级 error.log 无记录），
-#           431 由 Go/net-http 后端返回；脚本流程不依赖具体码值（400/431 均按
-#           "与常规请求不一致" 判定故障），L2 修复无条件幂等执行。
+#           Too Large"（且属 info 级日志，默认 error 级 error.log 无记录）；
+#           脚本流程不依赖具体码值（400/431 均按"与常规请求不一致"判定故障）。
 #
 # 参考解路径：
-#   步骤① curl 复现 431，查 nginx error log 定位 L1 → 调大 buffer，nginx -t 校验后 reload
-#   步骤③ L1 复测仍 431 → 排查后端源码，找到框架限制 → 调大阈值（步骤④）
-#   步骤⑤ 重新编译打包；步骤⑥ 清理日志后重启 Go 服务
-#   步骤⑨ 超长 header curl 端到端验证（入口 + 直连后端）
-#   步骤⑦⑧ 增加阈值预警观测（watchdog）与 431 高优先级质检门禁（quality gate）
+#   步骤① curl 分层复现（入口 + 直连 9100/15001/9000）定位拦截层
+#   步骤② L1 调大 nginx buffer，nginx -t 校验后 reload；步骤③ 复测（仍 431 → 中间层）
+#   步骤④ L2/L3 中间层配置调大 + 重启；L4 后端源码/配额档案调大（go:embed 须重编译）
 #   步骤④.4 注入逐 header 体积统计中间件（归因观测：定位哪个模块/header 注入过多）
+#   步骤⑤ 重新编译打包；步骤⑥ 清理日志并重启服务（含中间层）
+#   步骤⑥.5 Kafka message.max.bytes 动态对齐（非奖励项治理）
+#   步骤⑦ 生成阈值预警观测与 431 高优先级质检门禁；步骤⑧ 清理历史日志
+#   步骤⑨ 超长 header 端到端验证（入口 + 直连各层）+ nonce 链路证据自证
 #   步骤⑩ 生成 431 综合分析报告（diagnosis_report.md：链路级归因，非单点归责）
 #
 # 运行约定：在任务环境容器内以 root 执行（Debian/Ubuntu 系工具链）；
-#           nginx 与 Go 服务同容器；Go 模块位于 /app 下（含 go.mod）。
+#           全链路组件由 supervisord 编排；Go 模块位于 /app 下（含 go.mod）。
 # 幂等性：所有配置/源码修改均先注释旧值或带 grep 守卫再写入，备份为 *.solve.bak；
 #         重复执行不会叠加破坏环境；离线优先（GOPROXY=off），在线仅作兜底。
 # 退出语义：脚本跑完一轮后按 PASS/FAIL 返回 exit 0/1，交由平台按 reward 判定；
@@ -660,6 +666,44 @@ else
   say "步骤⑥：无源码/配置变更，跳过重启（幂等重跑）"
 fi
 
+# ---------- 步骤⑥.5：Kafka 异步审计总线治理（明示非奖励项：与同步 431 无关） ----------
+# 审计事件携带全量请求头快照（探针场景约 17-60KB），broker 侧 message.max.bytes 过小
+# 时以 MESSAGE_TOO_LARGE(error_code=10) 拒绝——属异步链路容量信号，综合报告需三角说明。
+say "步骤⑥.5：Kafka message.max.bytes 对齐（异步旁路治理，非奖励项）"
+KAFKA_BIN=/opt/kafka/bin
+KAF_MSG_NEW=262144
+KAF_MSG_BEFORE="$(grep -E '^message\.max\.bytes=' /opt/kafka/config/kraft/server.properties 2>/dev/null | head -n1 | cut -d= -f2 | tr -dc '0-9')"
+KAF_NOISE_BEFORE="$(grep -c 'kafka produce failed' /var/log/backend.log 2>/dev/null || true)"
+KAF_NOISE_BEFORE="${KAF_NOISE_BEFORE:-0}"
+KAF_ALTERED=0
+if [ -x "$KAFKA_BIN/kafka-broker-api-versions.sh" ]; then
+  # 等待 broker 就绪（JVM 慢启）；治理失败不 die——不影响奖励判定路径
+  for _ in $(seq 1 18); do
+    if timeout 10 "$KAFKA_BIN/kafka-broker-api-versions.sh" --bootstrap-server 127.0.0.1:9092 >/dev/null 2>&1; then break; fi
+    sleep 5
+  done
+  if timeout 30 "$KAFKA_BIN/kafka-configs.sh" --bootstrap-server 127.0.0.1:9092 \
+       --entity-type brokers --entity-name 1 --alter --add-config "message.max.bytes=${KAF_MSG_NEW}" >/dev/null 2>&1 \
+     && timeout 30 "$KAFKA_BIN/kafka-configs.sh" --bootstrap-server 127.0.0.1:9092 \
+       --entity-type brokers --entity-name 1 --describe 2>/dev/null | grep -q "message.max.bytes=${KAF_MSG_NEW}"; then
+    KAF_ALTERED=1
+    say ">> Kafka message.max.bytes 动态调至 ${KAF_MSG_NEW}（DYNAMIC_BROKER_CONFIG，免重启）"
+  else
+    warn "kafka-configs 动态修改未确认生效，回退静态配置 + 重启 broker（异步旁路，不阻断）"
+    timeout 60 supervisorctl restart kafka >/dev/null 2>&1 || warn "kafka 重启失败（异步旁路，不阻断）"
+  fi
+else
+  warn "未找到 Kafka 工具目录（$KAFKA_BIN）——异步治理跳过（非奖励项）"
+fi
+# 静态配置同步落盘（幂等）：动态值优先，静态值作为重启后的兜底
+if [ -f /opt/kafka/config/kraft/server.properties ] && ! grep -q "^message.max.bytes=${KAF_MSG_NEW}$" /opt/kafka/config/kraft/server.properties; then
+  backup /opt/kafka/config/kraft/server.properties
+  sed -i -E "s/^message\.max\.bytes=[0-9]+/message.max.bytes=${KAF_MSG_NEW}/" /opt/kafka/config/kraft/server.properties
+  say ">> Kafka 静态配置已同步：message.max.bytes=${KAF_MSG_NEW}（重启后兜底生效）"
+fi
+KAF_NOISE_AFTER="$(grep -c 'kafka produce failed' /var/log/backend.log 2>/dev/null || true)"
+KAF_NOISE_AFTER="${KAF_NOISE_AFTER:-0}"
+
 # ---------- 步骤⑦：生成预警观测与 431 质检门禁 ----------
 say "步骤⑦：生成预警观测与质检门禁（$OPS_DIR）"
 # 首次修复的原始阈值持久化（重复执行时报告中的"修改前"不漂移）
@@ -679,6 +723,7 @@ NGINX_LARGE_HEADER_BUFFER_BYTES=$(( NG_BUF_KB * 1024 ))
 APP_MAX_HEADER_BYTES=$(( QUOTA_APPLIED == 1 ? APP_QUOTA_MAX : APPLIED_APP_LIMIT ))
 TRACEGATE_MAX_HEADER_BYTES=${GATE_LIMIT:-}
 MESH_MAX_HEADER_BYTES=${MESH_LIMIT:-}
+KAFKA_MESSAGE_MAX_BYTES=${KAF_MSG_NEW}
 WARN_RATIO=${WARN_RATIO}
 ENTRY_URL=${ENTRY_URL}
 UPSTREAM_URL=${UPSTREAM_URL}
@@ -686,6 +731,7 @@ ORIG_NG_CHB="${NG_CHB_BEFORE}"
 ORIG_NG_BUF="${NG_BUF_BEFORE}"
 ORIG_APP_LIMIT="${APP_LIMIT_BEFORE}"
 ORIG_APP_QUOTA="${QUOTA_BEFORE}"
+ORIG_KAFKA_MSG="${KAF_MSG_BEFORE}"
 EOF
 
 cat > "$OPS_DIR/quality_gate.sh" <<'GEOF'
@@ -728,7 +774,9 @@ nginx -s reopen 2>/dev/null || true
 say "步骤⑨：超长 header 端到端验证"
 BASELINE="$(probe "$ENTRY_URL" "")"
 FINAL="$(probe "$ENTRY_URL" "$TEST_HEADER_BYTES")"
-if [ -n "$UPSTREAM_URL" ]; then DIRECT="$(probe "$UPSTREAM_URL" "$TEST_HEADER_BYTES")"; fi
+# "直达后端"探针固定业务端口 9000（UPSTREAM_URL 现指向入口第一跳 tracegate:9100，
+# 不能再作为后端直连口径——与验题契约的 127.0.0.1:9000 探针对齐）
+DIRECT="$(probe "$BE_URL" "$TEST_HEADER_BYTES")"
 FINAL_GATE="$(probe "$GATE_URL" "$TEST_HEADER_BYTES")"
 FINAL_MESH="$(probe "$MESH_URL" "$TEST_HEADER_BYTES")"
 FINAL_BACKEND="$(probe "$BE_URL" "$TEST_HEADER_BYTES")"
@@ -742,6 +790,24 @@ case "$BASELINE" in ""|000) PASS=0;; esac
 case "$FINAL"   in ""|000|431|414|5??) PASS=0;; esac
 [ -n "$BASELINE" ] && [ "$BASELINE" != "$FINAL" ] && PASS=0
 case "$DIRECT"  in 431|414|000) PASS=0;; esac
+
+# 链路证据自证（与验题契约同口径）：nonce 回环——回显须按序含 nonce→gate=→mesh= 且
+# 增幅 ≥2048B；异常即 PASS=0（防止中间层被绕过/注入行为被改动的"伪修复"通过）
+VFY="vfy$(date +%s%N)"
+TC_ECHO="$(curl -s -D - -o /dev/null --max-time 10 -H "X-Trace-Context: $VFY" "$ENTRY_URL" 2>/dev/null \
+  | grep -i '^x-trace-context:' | head -n1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/\r$//')"
+case "$TC_ECHO" in
+  *"$VFY"*"gate="*"mesh="*)
+    if [ "${#TC_ECHO}" -ge $(( ${#VFY} + 2048 )) ]; then
+      say "链路证据: nonce→gate→mesh 有序回显 ✅（增幅 ${#TC_ECHO}B）"
+    else
+      warn "链路证据: 回显增幅不足（${#TC_ECHO}B，span 未真实落头）"
+      PASS=0
+    fi ;;
+  *)
+    warn "链路证据: 回显异常（${TC_ECHO:0:40}...）——疑似中间层被绕过"
+    PASS=0 ;;
+esac
 
 GATE_RC=0
 bash "$OPS_DIR/quality_gate.sh" || GATE_RC=$?
@@ -794,6 +860,9 @@ case "${APP_KIND}" in
 esac
 
 # ROW_QUOTA 已在 4.3 按命中的配置档案逐条累计（含各自修改前值）
+# Kafka 治理方式描述（供报告引用）
+KAF_HOW="静态配置 + broker 重启兜底"
+[ "$KAF_ALTERED" = "1" ] && KAF_HOW="kafka-configs 动态 alter，免重启生效"
 
 if [ -n "$HDR_TOP" ]; then
   ATTR_DETAIL="- 逐 header 归因（后端 HDRSTAT 中间件）：请求头总长 ${HDR_TOTAL:-?}B，单个最大 header 为 ${HDR_TOP} —— 注入该 header 的上游模块（网关/认证/链路追踪等）是 header 体量增长的主要来源"
@@ -844,6 +913,13 @@ ${ATTR_DETAIL}
 - 复验记录：/app/ops/last_solve_result.txt
 - nginx 配置：/etc/nginx/nginx.conf（*.solve.bak 为修改前备份）
 - 后端模块：${MOD_DIR}（${L2_KEY} 见 ${WIRE_FILE##*/}）；中间层：/app/tracegate/tracegate.yaml、/app/mesh/sidecar.yaml
+
+## 6. 异步审计旁路（Kafka）三角说明
+- Kafka message.max.bytes：${KAF_MSG_BEFORE:-未知} → ${KAF_MSG_NEW}（${KAF_HOW}）
+- 故障期表现：审计事件携带**全量请求头快照**（探针场景约 17-60KB），超过 broker 限额被拒，
+  backend 日志出现 \`kafka produce failed: ... error_code=10(MESSAGE_TOO_LARGE)\`（治理前采样 ${KAF_NOISE_BEFORE} 条）
+- 三角结论：MESSAGE_TOO_LARGE 是**异步审计链路**的容量信号，与同步链路 431 的拦截层不同——
+  排障时应分流处置：同步 431 逐层定位（本报告第 1-2 节），异步容量信号对齐 broker 限额（本节）
 EOF
 say "报告: $REPORT"
 
@@ -863,6 +939,11 @@ final_backend_status=${FINAL_BACKEND:-NA}
 app_max_header_bytes=${APPLIED_APP_LIMIT}
 gate_max_header_bytes=${GATE_LIMIT:-NA}
 mesh_max_header_bytes=${MESH_LIMIT:-NA}
+kafka_message_max_bytes=${KAF_MSG_NEW}
+kafka_message_max_bytes_before=${KAF_MSG_BEFORE:-NA}
+kafka_altered_dynamic=${KAF_ALTERED}
+kafka_produce_failed_before=${KAF_NOISE_BEFORE}
+kafka_produce_failed_after=${KAF_NOISE_AFTER}
 nginx_large_header_buffers=${NG_BUF_N}x$(( NG_BUF_KB * 1024 ))B
 quality_gate_exit=${GATE_RC}
 report=diagnosis_report.md

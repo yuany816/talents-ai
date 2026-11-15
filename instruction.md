@@ -37,8 +37,12 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
    - 后端侧的 header 限额真实调大并生效——它可能存在于标准库/框架层，也可能存在于
      业务代码及其配置文件中；原故障值 `8192` 不得以任何等值书写形态残留于
      /app/backend 的源码或配置（验题做字面匹配，见"验题契约"）；
-   - 链路其余各层（tracegate / meshd）的限额同样必须真实调大，由端到端行为探针判定。
-4. **持续防线，产物落盘于 /app/ops/**：
+   - 链路其余各层（tracegate / meshd）的限额同样必须真实调大——由端到端行为探针判定，
+     并辅以各自目录下 `max_header_bytes` 键上下文的残留扫描（10240 / 12288）；
+4. **异步链路治理（明示不计入判定）**：Kafka 审计旁路的 `message.max.bytes` 与同步 431
+   无关，是否对齐不影响 reward；但其报错（backend 日志中的 MESSAGE_TOO_LARGE）属于
+   链路容量信号，综合报告中应予三角说明；
+5. **持续防线，产物落盘于 /app/ops/**：
    - `header_limits.env`：链路限额与预警参数，**必须**包含 `NGINX_LARGE_HEADER_BUFFER_BYTES`
      （nginx 侧单 header 上限，字节，须与 nginx 生效单缓冲一致）与 `WARN_RATIO`
      （预警阈值百分比，有效范围 **[50, 90]**，缺失时验题按 80 处理）；
@@ -67,6 +71,10 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
 | L1 要求 ≥17408B（17KiB） | 完整 header 行口径：16384B 值 + 行开销约 18B + 1KiB 余量——恰好 16384 的缓冲会误拒合规探针 |
 | LIM 须 == nginx 生效单缓冲 | 边界与预警判定需与实际限额同一数值基准 |
 | L2 扫描形态 | 十进制 `8192` 不限上下文；等值移码/十六进制书写仅在 `MaxHeaderBytes`/`max_header_bytes` 键上下文中扫描（均豁免备份后缀文件） |
+| 中间层扫描形态 | tracegate 原故障值 `10240`、meshd 原故障值 `12288`：仅锚定 `/app/tracegate`、`/app/mesh` 下 `max_header_bytes` 键上下文（豁免备份后缀文件） |
+| 组件探针/指纹 | tracegate(:9100) 与 meshd(:15001) 的 `/componentz` 须可达且响应含各自组件名；kafka(:9092) 仅 TCP 探活（3×2s 重试，容 JVM 慢启）——组件为环境组成部分，移除/替换即不通过 |
+| 注入链 nonce 探针 | 验题注入一次性 `X-Trace-Context: vfy<纳秒>`；回显须**按序**含 nonce→`gate=`→`mesh=` 段且较 nonce 增幅 ≥2048B（静态 add_header 无法预知 nonce；绕层则无注入段） |
+| span 固定尺寸 | gate span 768B / mesh span 1536B / X-Mesh-Baggage 512B（每请求注入增幅 ≈2.9KB）——容量探针数学的前提，不得缩水或拆除 |
 | 注入链完整性探针 | 入口常规请求的响应 `X-Trace-Context` 须同时含 `gate=` 与 `mesh=` 段（tracegate/meshd 注入、backend 回显）——防绕层伪修复 |
 | 上边界探针 LIM+4096 | 必须越过声明上限以验证"仍被拒绝"；LIM>1MB 时跳过（受单参数长度限制） |
 | 预警探针 THRESH+512（≤LIM−1024） | 必须越过阈值触发告警，但不得越过上限 |
@@ -75,14 +83,18 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
 | 静默窗口 10s / 告警窗口 30s | 覆盖请求时同步写入的观测粒度加反应余量 |
 | 注入日志行格式 | 与 nginx hdrsize/error/access 日志真实格式一致，用于触发门禁行为，非伪造结论 |
 
-**0) 环境在线**：入口与后端任一不可达 → 不通过。
+**0) 环境在线**：入口与后端任一不可达 → 不通过；tracegate(:9100)/meshd(:15001) 的
+`/componentz` 不可达、或响应缺对应组件名指纹（占位桩）→ 不通过；kafka(:9092) TCP 探活
+失败（含 3×2s 重试）→ 不通过。
 
 **1) 端到端（多路由/多层）**（探针：值为 16384 个 `x` 的单个自定义 header，头名不限）：
 - 入口 `/api/v1/profile` 与 `/healthz` + 超长 header → 200；`/api/v1/profile` 常规请求 → 200；
 - 直连 127.0.0.1:9000 同路径 + 超长 header → 200；
 - 入口响应头须含 `Server: nginx`（防绕过反代直接放行）；
-- **注入链完整性**：入口常规请求的响应头须含 `X-Trace-Context` 且同时包含 `gate=` 与
-  `mesh=` 注入段（tracegate/meshd 注入、backend 回显）——绕过或拆除中间层的方案不通过；
+- **注入链完整性**：验题注入一次性 nonce `X-Trace-Context: vfy<纳秒>` 后，入口响应头回显的
+  `X-Trace-Context` 须**按序**包含该 nonce、`gate=` 与 `mesh=` 注入段（真实注入是顺序追加，
+  tracegate/meshd 注入、backend 回显），且回显值较 nonce 增幅 ≥2048B——绕过/拆除中间层
+  或以静态头伪造注入段的方案不通过；
 - **响应体特征校验**：/api/v1/profile 返回体含 `"msg":"ok"`、/healthz 返回体（去空白后）
   等于 `ok`——证明是真实应用在服务，替换成"永远 200"的桩不会通过。
 
@@ -97,7 +109,10 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
   历史备份文件不计入）；调大到任何足够字节的表达式/数值均可，
   由检查 1/3 的行为探针证明足够；
 - **已知局限（披露）**：后端侧行为上边界受探针尺寸限制不可黑盒探测（MB 级 header
-  不现实），后端侧以"行为探针 + 源码/配置扫描"组合判定。
+  不现实），后端侧以"行为探针 + 源码/配置扫描"组合判定；
+- 中间层（tracegate / meshd）限额为配置驱动：`/app/tracegate`、`/app/mesh` 下
+  `max_header_bytes` 键上下文分别残留原故障值 `10240`、`12288` → 不通过
+  （端到端行为探针为主要判定，扫描为辅助证据）。
 
 **3) 边界与输入覆盖（以你声明的 LIM 为基准）**：
 - **声明一致性**：header_limits.env 中的 `NGINX_LARGE_HEADER_BUFFER_BYTES` 折算后必须与
@@ -131,7 +146,8 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
 ④ 实质归因：含量化观测证据（`HDRSTAT` / `max_header` / `request_length` 至少其一），
    且同时具备"谁注入过多"（含"注入"或"增长"）与"哪层限制过小"（含"过小"/"未同步"/"未扩容"）两类表述；
 ⑤ 容量依据：含"余量"或"sizing"；
-⑥ 提及所修改的限制项名称（`large_client_header_buffers` / `MaxHeaderBytes` / `ReadBufferSize` 至少其一）。
+⑥ 提及所修改的限制项名称（`large_client_header_buffers` / `MaxHeaderBytes` / `ReadBufferSize` 至少其一）；
+⑦ 中间层限额对照：同时含 tracegate 原故障值 `10240` 与 meshd 原故障值 `12288` 的数值对照。
 
 **产物 schema（结构化输出契约，验题按此读取）**：
 - `/app/ops/header_limits.env`：KEY=VALUE 行；**必含** `NGINX_LARGE_HEADER_BUFFER_BYTES`
@@ -148,6 +164,9 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
 - 修改 nginx 配置后需通过 nginx -t 校验再重载；
 - 修改 Go 源码后需重新编译并重启服务；
 - 中间层组件（tracegate/meshd）的限额配置在进程启动时读取，修改后需重启对应组件；
+- 链路的注入行为是容量探针的数学前提：gate span（768B）/ mesh span（1536B）/
+  X-Mesh-Baggage（512B）不得缩水或拆除，kafka/tracegate/meshd/trace-collector 为环境
+  组成部分，不可移除或替换为桩；
 - 不依赖外部网络（工具链与源码均在环境内）；
 - 观测/门禁需容忍日志截断与轮转（验题会截断日志）。
 

@@ -20,4 +20,4 @@ timeout_sec = 300
 [metadata]
 difficulty = "hard"        # easy / medium / hard
 category = "incident-coding"
-tags = ["nginx", "http-431", "go", "operations", "observability", "capacity-sizing"]
+tags = ["nginx", "http-431", "go", "service-mesh", "kafka", "operations", "observability", "capacity-sizing"]
