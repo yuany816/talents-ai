@@ -1,0 +1,11 @@
+# mesh 数据面 sidecar（meshd）运行配置
+# 说明：本进程模拟 service mesh 数据面 sidecar（随业务实例部署）——
+#   1) 对每个请求做 header 上限检查（超限 431，Envoy 语义）；
+#   2) 追加一段恰为 span_bytes 字符的 mesh span，并附带 X-Mesh-Baggage 头
+#      （baggage 由控制面下发，随跳数传播）；
+#   3) 反向代理到本实例业务容器（backend）。
+listen: 127.0.0.1:15001
+upstream: http://127.0.0.1:9000
+max_header_bytes: 12288
+span_bytes: 1536
+baggage_bytes: 512

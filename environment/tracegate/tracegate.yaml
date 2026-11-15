@@ -1,0 +1,9 @@
+# NG 接入网关 trace 插件（tracegate）运行配置
+# 说明：本进程是接入网关的全链路追踪插件——
+#   1) 对每个请求做 header 预算检查（超限 431）；
+#   2) 为每个请求在 X-Trace-Context 上追加一段 gate span（trace 上下文随跳数增长）；
+#   3) 反向代理到下游（mesh sidecar）。
+listen: 127.0.0.1:9100
+upstream: http://127.0.0.1:15001
+max_header_bytes: 10240
+span_bytes: 768

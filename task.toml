@@ -5,10 +5,10 @@ name = "humanlaya/coding-task"
 version = "1.0"
 
 [agent]
-timeout_sec = 900          # agent 解题的时间限制（秒），难题建议 900-1200
+timeout_sec = 1200         # agent 解题的时间限制（秒），难题建议 900-1200
 
 [environment]
-timeout_sec = 900
+timeout_sec = 1500
 build_timeout_sec = 600
 cpus = 1
 memory_mb = 4096
@@ -20,4 +20,4 @@ timeout_sec = 300
 [metadata]
 difficulty = "hard"        # easy / medium / hard
 category = "incident-coding"
-tags = ["nginx", "http-431", "go", "operations", "observability"]
+tags = ["nginx", "http-431", "go", "operations", "observability", "capacity-sizing"]

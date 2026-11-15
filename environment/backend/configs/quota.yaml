@@ -1,0 +1,3 @@
+# 请求头配额（经构建期固化随二进制部署；加载方式见 internal/config）
+# 2023 年按当时业务体量设定
+max_header_bytes: 8192

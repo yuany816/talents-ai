@@ -33,6 +33,15 @@ direct=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "X-Verify-Token
 [ "$direct" = "200" ] && ok "直连后端超长header → 200" || fail "直连后端超长header → $direct"
 srv=$(curl -s -D - -o /dev/null --max-time 10 "$ENTRY/api/v1/profile" | grep -i '^server:' | head -n1)
 echo "$srv" | grep -qi nginx && ok "入口为 nginx 反代" || fail "入口响应缺 Server: nginx"
+# 链路完整性（防"绕过中间层直连下游"式伪修复）：入口请求经 tracegate/meshd 注入链
+# 后由后端回显 X-Trace-Context——响应头须同时含 gate= 与 mesh= 注入段。
+# 若中间层被绕开或注入/回显被拆除，该头缺失或缺少对应段。
+tc_hdr=$(curl -s -D - -o /dev/null --max-time 10 "$ENTRY/api/v1/profile" | grep -i '^x-trace-context:' | head -n1)
+if echo "$tc_hdr" | grep -q 'gate=' && echo "$tc_hdr" | grep -q 'mesh='; then
+  ok "注入链完整（X-Trace-Context 含 gate/mesh 注入段）"
+else
+  fail "注入链不完整（响应缺 X-Trace-Context 或缺 gate/mesh 注入段——疑似绕过中间层）"
+fi
 # 响应体特征（防"桩替换"式作弊：必须是真实应用在服务，而非只回 200 的替身）
 body=$(curl -s --max-time 10 "$ENTRY/api/v1/profile")
 echo "$body" | grep -q '"msg":"ok"' && ok "业务路由响应体特征匹配" || fail "业务路由响应体异常（疑似应用被替换）"
@@ -49,10 +58,14 @@ if [ -n "$NG_BUF_B" ] && [ "$NG_BUF_B" -ge 17408 ] 2>/dev/null; then
 else
   fail "nginx header 缓冲未调大（当前=${NG_BUF:-无}，需按完整 header 行口径 ≥17408B）"
 fi
-if grep -rqIE '(MaxHeaderBytes|max_header_bytes)["'\'':= ]*8192([^0-9]|$)' /app/backend \
+# L2 扫描按关键词锚定 + 十进制全量两种口径：
+# - 十进制形态 (^|[^0-9])8192([^0-9]|$) 不限上下文（覆盖业务配额键、退役入口常量等任意书写处）；
+# - 等值移码/十六进制形态（1 << 13 / 0x2000）仅锚定 MaxHeaderBytes/max_header_bytes 上下文，
+#   避免误伤无关代码中的位移/十六进制常量；数值有效性由检查 1/3 的行为探针证明。
+if grep -rqIE '(^|[^0-9])8192([^0-9]|$)|(MaxHeaderBytes|max_header_bytes)["'\'':= ]*(1[[:space:]]*<<[[:space:]]*13([^0-9]|$)|0[xX]2000([^0-9a-fA-F]|$))' /app/backend \
     --exclude='*.bak' --exclude='*.bak.*' --exclude='*.candbak' --exclude='*.orig' \
     --exclude='*.old' --exclude='*.backup' --exclude='*.disabled' 2>/dev/null; then
-  fail "后端侧 header 限额仍残留原故障值 8192（源码/配置）"
+  fail "后端侧 header 限额仍残留原故障值 8192（十进制或等值移码/十六进制形态，源码/配置）"
 else
   ok "后端侧 header 限额已真实调整（源码/配置扫描）"
 fi

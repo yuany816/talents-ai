@@ -1,0 +1,2 @@
+# prod profile 配额档案（v1 规划按 HEADER_LIMIT_PROFILE 选择，未实装；存档备查）
+max_header_bytes: 65536

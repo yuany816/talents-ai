@@ -182,6 +182,12 @@ fi
 say "步骤①：复现故障（超长 header ${TEST_HEADER_BYTES}B 打入口）"
 INITIAL="$(probe "$ENTRY_URL" "$TEST_HEADER_BYTES")"
 say "初始状态码: ${INITIAL:-无响应}"
+# 分层直连初始状态码（供综合报告的分层状态码链与"哪一层拦截"对照）
+GATE_URL="http://127.0.0.1:9100/healthz"; MESH_URL="http://127.0.0.1:15001/healthz"; BE_URL="http://127.0.0.1:9000/healthz"
+INITIAL_GATE="$(probe "$GATE_URL" "$TEST_HEADER_BYTES")"
+INITIAL_MESH="$(probe "$MESH_URL" "$TEST_HEADER_BYTES")"
+INITIAL_BACKEND="$(probe "$BE_URL" "$TEST_HEADER_BYTES")"
+say "分层初始状态: tracegate(9100)=${INITIAL_GATE:-无} meshd(15001)=${INITIAL_MESH:-无} backend(9000)=${INITIAL_BACKEND:-无}"
 echo "----- nginx error log 近期相关记录（定位依据） -----"
 grep -h "too long header line" /var/log/nginx/error.log 2>/dev/null | tail -n 2 || true
 grep -h "upstream sent too big header" /var/log/nginx/error.log 2>/dev/null | tail -n 2 || true
@@ -291,15 +297,20 @@ for f in $FAST_FILES; do
 done
 
 # 4.2 net/http（gin/echo/chi 等）：MaxHeaderBytes（默认 1MB）
+# 多包布局下 MaxHeaderBytes 可能出现在多个 .go 文件（含退役入口存档），
+# 因此遍历所有命中文件逐个替换（不使用 break）；WIRE_FILE 取含 http.Server{ 的
+# 文件供 4.4 观测中间件接线（接线 sed 只认 Handler: 单行书写）。
 if [ "$APPLIED_APP_LIMIT" = "0" ] && has_pattern 'MaxHeaderBytes'; then
   for f in $MAIN_GO_FILES; do
     if grep -q 'MaxHeaderBytes' "$f"; then
       note_edit "$f"
-      APP_LIMIT_BEFORE="$(grep -hoE 'MaxHeaderBytes[[:space:]]*[:=][[:space:]]*[^,;}]*' "$f" | head -n1 | sed -E 's/^MaxHeaderBytes[[:space:]]*[:=][[:space:]]*//')"
-      [ -n "$APP_LIMIT_BEFORE" ] || APP_LIMIT_BEFORE="未配置(net/http默认1MB)"
+      if [ "$APP_LIMIT_BEFORE" = "未知" ]; then
+        APP_LIMIT_BEFORE="$(grep -hoE 'MaxHeaderBytes[[:space:]]*[:=][[:space:]]*[^,;}]*' "$f" | head -n1 | sed -E 's/^MaxHeaderBytes[[:space:]]*[:=][[:space:]]*//')"
+        [ -n "$APP_LIMIT_BEFORE" ] || APP_LIMIT_BEFORE="未配置(net/http默认1MB)"
+      fi
       sed -i -E "s/(MaxHeaderBytes[[:space:]]*[:=][[:space:]]*)[^,;}]+/\1 ${APP_NETHTTP_MAX}/" "$f"
-      APPLIED_APP_LIMIT="$APP_NETHTTP_MAX"; WIRE_FILE="$f"; APP_KIND=nethttp
-      break
+      APPLIED_APP_LIMIT="$APP_NETHTTP_MAX"; APP_KIND=nethttp
+      grep -q 'http\.Server{' "$f" && WIRE_FILE="$f"
     fi
   done
 fi
@@ -317,20 +328,51 @@ fi
 
 # 4.3 业务配额/配置层限额（无条件幂等加固：配额中间件等配置驱动的限制同样要调大，
 #     否则仅修框架层时业务配额仍会拦截）
-for cf in $(find "$MOD_DIR" -maxdepth 3 -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.json' -o -name '*.toml' -o -name '*.ini' -o -name '*.conf' -o -name '*.env' \) -not -path '*/vendor/*' 2>/dev/null); do
+# 多份配置档案可能同时命中（后端 configs/ 与中间层 tracegate/mesh 组件配置）：
+# 逐文件记录修改前值并累计报告行，QUOTA_BEFORE（写入 header_limits.env 的
+# ORIG_APP_QUOTA）取首个命中值；中间层组件配置在进程启动时读取，改动需重启生效。
+ROW_QUOTA=""
+CHAIN_CFG_CHANGED=0
+for cf in $(find "$MOD_DIR" /app/tracegate /app/mesh -maxdepth 3 -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.json' -o -name '*.toml' -o -name '*.ini' -o -name '*.conf' -o -name '*.env' \) -not -path '*/vendor/*' 2>/dev/null); do
   QRE="max_header_bytes[\"':= ]*[0-9]+"
   grep -qiE "$QRE" "$cf" 2>/dev/null || continue
-  QUOTA_BEFORE="$(grep -hoiE "$QRE" "$cf" | head -n1 | grep -oE '[0-9]+$')"
+  QBEFORE="$(grep -hoiE "$QRE" "$cf" | head -n1 | grep -oE '[0-9]+$')"
+  [ -z "$QUOTA_BEFORE" ] && QUOTA_BEFORE="$QBEFORE"
   backup "$cf"
   sed -i -E "s/((max_header_bytes|max_header_size)[\"' ]*[:=][\"' ]*)[0-9]+/\1${APP_QUOTA_MAX}/g;
              s/((read_buffer_size|header_buffer_size)[\"' ]*[:=][\"' ]*)[0-9]+/\1${APP_FASTHTTP_BUF}/g" "$cf"
   if [ "$(grep -hoiE "$QRE" "$cf" | head -n1 | grep -oE '[0-9]+$')" = "$APP_QUOTA_MAX" ]; then
     QUOTA_APPLIED=1; CONFIG_CHANGED=1
-    say ">> 业务配额/配置层已调大: $cf（${QUOTA_BEFORE:-?} → ${APP_QUOTA_MAX}）"
+    case "$cf" in
+      /app/tracegate/*|/app/mesh/*) CHAIN_CFG_CHANGED=1;;
+      *) # 配额配置经 go:embed 随二进制固化（磁盘文件为构建期存档，改完重启不生效），
+         # 必须重新编译部署——同置 SOURCE_CHANGED=1 触发步骤⑤重建 + 步骤⑥替换二进制。
+         SOURCE_CHANGED=1;;
+    esac
+    ROW_QUOTA="${ROW_QUOTA}
+| L2 | 业务配额档案 ${cf#$MOD_DIR/} | max_header_bytes | ${QBEFORE:-?} | ${APP_QUOTA_MAX} |"
+    say ">> 业务配额/配置层已调大: $cf（${QBEFORE:-?} → ${APP_QUOTA_MAX}）"
   else
     warn "配额调整未生效，请人工检查 $cf"
   fi
 done
+
+# 4.5 全局残留清理：原故障值 8192 可能残留在退役入口存档等"非配额键"位置
+#     （验题 L2 扫描覆盖 /app/backend 全部文本文件，任意残留均判不通过）。
+#     清理前捕获残留位置供综合分析报告引用；同一表达式跑两遍，防相邻命中漏替。
+RESIDUAL_8192="$(grep -rlIE '(^|[^0-9])8192([^0-9]|$)' "$MOD_DIR" \
+  --exclude='*.bak' --exclude='*.bak.*' --exclude='*.candbak' --exclude='*.orig' \
+  --exclude='*.old' --exclude='*.backup' --exclude='*.disabled' 2>/dev/null || true)"
+ORIG_FAULT_FILES=""
+if [ -n "$RESIDUAL_8192" ]; then
+  for rf in $RESIDUAL_8192; do
+    ORIG_FAULT_FILES="$ORIG_FAULT_FILES ${rf#$MOD_DIR/}"
+    backup "$rf"
+    sed -i -E 's/(^|[^0-9])8192([^0-9]|$)/\11048576\2/g' "$rf"
+    sed -i -E 's/(^|[^0-9])8192([^0-9]|$)/\11048576\2/g' "$rf"
+    say ">> 原故障值残留已清理: $rf（8192 → 1048576）"
+  done
+fi
 
 # 4.4 注入逐 header 体积统计中间件（归因观测：哪个模块/header 注入过多）
 if [ "$SOURCE_CHANGED" = "1" ] && [ -n "$WIRE_FILE" ] && [ -n "$APP_KIND" ]; then
@@ -547,20 +589,28 @@ fi
 
 # ---------- 步骤⑥：清理日志并重启 Go 服务 ----------
 find_app_pid() {
-  local pid="" exe bn
+  # 链路多组件化后，UP_PORT（nginx 第一个 proxy_pass 的目标）可能是中间层
+  # （如 tracegate:9100）而非业务后端：按端口找到的监听进程必须校验其 exe 属于
+  # 后端模块目录，否则退回 cmdline 匹配——防止误把中间层二进制替换成后端产物。
+  local pid="" exe bn c
   if [ -n "$UP_PORT" ]; then
     if command -v ss >/dev/null 2>&1; then
       pid="$(ss -ltnp 2>/dev/null | grep -E "[:.]${UP_PORT}[[:space:]]" | sed -nE 's/.*pid=([0-9]+).*/\1/p' | head -n1)"
     elif command -v netstat >/dev/null 2>&1; then
       pid="$(netstat -ltnp 2>/dev/null | grep -E "[:.]${UP_PORT}[[:space:]]" | sed -nE 's#.*[^0-9]([0-9]+)/[A-Za-z].*#\1#p' | head -n1)"
     fi
+    exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+    case "$exe" in
+      "$MOD_DIR"/*) : ;;           # 确为后端模块目录下的二进制
+      *) pid="" ;;                 # 端口属于其他组件（tracegate/meshd 等），放弃
+    esac
   fi
   if [ -z "$pid" ]; then
     for c in $(pgrep -f "$MOD_DIR" 2>/dev/null); do
       [ "$c" = "$$" ] && continue
       exe="$(readlink "/proc/$c/exe" 2>/dev/null || true)"; bn="$(basename "${exe:-}")"
-      case "$bn" in bash|sh|dash|sleep|tail|python*|nginx|supervisord|sudo) continue;; esac
-      pid="$c"; break
+      case "$bn" in bash|sh|dash|sleep|tail|python*|nginx|supervisord|sudo|java|tee) continue;; esac
+      case "$exe" in "$MOD_DIR"/*) pid="$c"; break;; esac
     done
   fi
   printf '%s' "$pid"
@@ -596,7 +646,16 @@ if [ "$SOURCE_CHANGED" = "1" ] || [ "$CONFIG_CHANGED" = "1" ]; then
   if [ "$RESTARTED" = "0" ]; then
     die "未能通过 supervisorctl 重启服务（环境应为 supervisord 编排）"
   fi
-  if wait_up "${UPSTREAM_URL:-$ENTRY_URL}"; then say "Go 服务已恢复监听"; else warn "服务端口未就绪，继续验证"; fi
+  # 中间层组件（tracegate/meshd）的限额配置在进程启动时读取：配置有改动时一并重启
+  # 方可生效（后端配额是构建期固化，走二进制替换；各层生效语义不同，见综合报告）。
+  if [ "$CHAIN_CFG_CHANGED" = "1" ] && command -v supervisorctl >/dev/null 2>&1 && supervisorctl status >/dev/null 2>&1; then
+    if timeout 60 supervisorctl restart tracegate meshd >/dev/null 2>&1; then
+      say "中间层组件已重启（tracegate/meshd 配置生效）"
+    else
+      warn "tracegate/meshd 重启失败，请人工确认 supervisorctl 程序名"
+    fi
+  fi
+  if wait_up "${UPSTREAM_URL:-$ENTRY_URL}"; then say "链路入口已恢复监听"; else warn "服务端口未就绪，继续验证"; fi
 else
   say "步骤⑥：无源码/配置变更，跳过重启（幂等重跑）"
 fi
@@ -610,12 +669,16 @@ if [ -f "$OPS_DIR/header_limits.env" ]; then
   _o3="$(sed -n 's/^ORIG_APP_LIMIT=//p' "$OPS_DIR/header_limits.env" | head -n1 | tr -d '"')"; [ -n "$_o3" ] && APP_LIMIT_BEFORE="$_o3"
   _o4="$(sed -n 's/^ORIG_APP_QUOTA=//p' "$OPS_DIR/header_limits.env" | head -n1 | tr -d '"')"; [ -n "$_o4" ] && QUOTA_BEFORE="$_o4"
 fi
+GATE_LIMIT="$(grep -hE '^max_header_bytes:' /app/tracegate/tracegate.yaml 2>/dev/null | head -n1 | grep -oE '[0-9]+$')"
+MESH_LIMIT="$(grep -hE '^max_header_bytes:' /app/mesh/sidecar.yaml 2>/dev/null | head -n1 | grep -oE '[0-9]+$')"
 cat > "$OPS_DIR/header_limits.env" <<EOF
 # solve.sh 生成 —— 全链路 header 限额与预警参数（单一事实来源）
 NGINX_CLIENT_HEADER_BUFFER_BYTES=$(( NG_CHB_KB * 1024 ))
 NGINX_LARGE_HEADER_BUFFER_COUNT=${NG_BUF_N}
 NGINX_LARGE_HEADER_BUFFER_BYTES=$(( NG_BUF_KB * 1024 ))
 APP_MAX_HEADER_BYTES=$(( QUOTA_APPLIED == 1 ? APP_QUOTA_MAX : APPLIED_APP_LIMIT ))
+TRACEGATE_MAX_HEADER_BYTES=${GATE_LIMIT:-}
+MESH_MAX_HEADER_BYTES=${MESH_LIMIT:-}
 WARN_RATIO=${WARN_RATIO}
 ENTRY_URL=${ENTRY_URL}
 UPSTREAM_URL=${UPSTREAM_URL}
@@ -655,7 +718,7 @@ chmod 0755 "$OPS_DIR/quality_gate.sh"
 
 # ---------- 步骤⑧：清理历史日志 ----------
 say "步骤⑧：清理历史日志（预警由后端观测中间件在请求时同步写入 warnings.log）"
-for lg in $NG_LOGS "$OPS_DIR/app.log" /var/log/backend.log; do
+for lg in $NG_LOGS "$OPS_DIR/app.log" /var/log/backend.log /var/log/tracegate.log /var/log/meshd.log; do
   case "$lg" in /*) [ -f "$lg" ] && : > "$lg" ;; esac
 done
 nginx -s reopen 2>/dev/null || true
@@ -666,6 +729,10 @@ say "步骤⑨：超长 header 端到端验证"
 BASELINE="$(probe "$ENTRY_URL" "")"
 FINAL="$(probe "$ENTRY_URL" "$TEST_HEADER_BYTES")"
 if [ -n "$UPSTREAM_URL" ]; then DIRECT="$(probe "$UPSTREAM_URL" "$TEST_HEADER_BYTES")"; fi
+FINAL_GATE="$(probe "$GATE_URL" "$TEST_HEADER_BYTES")"
+FINAL_MESH="$(probe "$MESH_URL" "$TEST_HEADER_BYTES")"
+FINAL_BACKEND="$(probe "$BE_URL" "$TEST_HEADER_BYTES")"
+say "分层修复后状态: tracegate(9100)=${FINAL_GATE:-无} meshd(15001)=${FINAL_MESH:-无} backend(9000)=${FINAL_BACKEND:-无}"
 say "常规请求(入口)      : ${BASELINE:-无响应}"
 say "超长header(入口)    : ${FINAL:-无响应}  （修复前=${INITIAL} / L1后=${AFTER_NGINX}）"
 say "超长header(直达后端): ${DIRECT:-跳过}"
@@ -707,6 +774,17 @@ HDR_TOTAL="$(printf '%s' "$HDRSTAT_LINE" | sed -nE 's/.*total=([0-9]+)B.*/\1/p')
 HDR_TOP="$(printf '%s' "$HDRSTAT_LINE" | sed -nE 's/.*max_header=([^[:space:]]+).*/\1/p')"
 ENTRY_LEN="$(tail -n1 /var/log/nginx/hdrsize.log 2>/dev/null | awk '{print $3}')"
 [ -n "$ENTRY_LEN" ] && ENTRY_LEN="${ENTRY_LEN}B" || ENTRY_LEN="N/A"
+# 中间层逐层体量证据（GATESTAT/MESHSTAT 由组件在请求处理路径打印）
+GATESTAT_LINE="$(grep -h 'GATESTAT' /var/log/tracegate.log 2>/dev/null | grep 'verdict=PASS' | tail -n1)"
+MESHSTAT_LINE="$(grep -h 'MESHSTAT' /var/log/meshd.log 2>/dev/null | grep 'verdict=PASS' | tail -n1)"
+GATE_IN="$(printf '%s' "$GATESTAT_LINE" | sed -nE 's/.*total=([0-9]+)B.*/\1/p')"
+GATE_TRACE_OUT="$(printf '%s' "$GATESTAT_LINE" | sed -nE 's/.*trace_out=([0-9]+)B.*/\1/p')"
+MESH_IN="$(printf '%s' "$MESHSTAT_LINE" | sed -nE 's/.*total=([0-9]+)B.*/\1/p')"
+MESH_TRACE_OUT="$(printf '%s' "$MESHSTAT_LINE" | sed -nE 's/.*trace_out=([0-9]+)B.*/\1/p')"
+# 注入量取值（容量推导依据：后端输入 ≈ 入口探针 + 各跳注入）
+GATE_SPAN="$(sed -n 's/^span_bytes:[[:space:]]*//p' /app/tracegate/tracegate.yaml 2>/dev/null | head -n1 | tr -dc '0-9')"
+MESH_SPAN="$(sed -n 's/^span_bytes:[[:space:]]*//p' /app/mesh/sidecar.yaml 2>/dev/null | head -n1 | tr -dc '0-9')"
+MESH_BAGGAGE="$(sed -n 's/^baggage_bytes:[[:space:]]*//p' /app/mesh/sidecar.yaml 2>/dev/null | head -n1 | tr -dc '0-9')"
 
 case "${APP_KIND}" in
   fiber)    APP_LABEL="Go 后端（fiber 框架）";    L2_KEY="ReadBufferSize";;
@@ -715,10 +793,7 @@ case "${APP_KIND}" in
   *)        APP_LABEL="Go 后端";                 L2_KEY="header 限额";;
 esac
 
-ROW_QUOTA=""
-if [ "$QUOTA_APPLIED" = "1" ]; then
-  ROW_QUOTA="| L2 | ${APP_LABEL}（业务配额中间件，启动时从配置加载） | max_header_bytes | ${QUOTA_BEFORE:-?} | ${APP_QUOTA_MAX} |"
-fi
+# ROW_QUOTA 已在 4.3 按命中的配置档案逐条累计（含各自修改前值）
 
 if [ -n "$HDR_TOP" ]; then
   ATTR_DETAIL="- 逐 header 归因（后端 HDRSTAT 中间件）：请求头总长 ${HDR_TOTAL:-?}B，单个最大 header 为 ${HDR_TOP} —— 注入该 header 的上游模块（网关/认证/链路追踪等）是 header 体量增长的主要来源"
@@ -733,10 +808,12 @@ cat > "$REPORT" <<EOF
 
 ## 1. 现象与复现
 - 复现方法：向入口发送携带 ${TEST_HEADER_BYTES}B 超长 header 的 curl 请求
-- 状态码链：修复前=${INITIAL} → 仅修 L1(nginx) 后=${AFTER_NGINX} → L1+L2 修复后=${FINAL}（常规请求=${BASELINE}）
-- 层面现象：实测 nginx 1.22 对超长 header 行返回 400 "Request Header Or Cookie Too Large"（info 级日志，默认 error 级 error.log 无记录）；431 由后端框架返回，入口观察到的 431 是后端拦截的透传结果
+- 链路：nginx(:80) → tracegate(:9100，接入网关 trace 插件) → meshd(:15001，mesh 数据面 sidecar) → backend(:9000)；另有异步审计旁路（Kafka），与同步链路 431 无关
+- 状态码链（入口）：修复前=${INITIAL} → 仅修 L1(nginx) 后=${AFTER_NGINX} → 全链路限额修复后=${FINAL}（常规请求=${BASELINE}）
+- 分层直连状态码链：tracegate(9100) ${INITIAL_GATE:-无}→${FINAL_GATE:-无}；meshd(15001) ${INITIAL_MESH:-无}→${FINAL_MESH:-无}；backend(9000) ${INITIAL_BACKEND:-无}→${FINAL_BACKEND:-无}
+- 层面现象：实测 nginx 1.22 对超长 header 行返回 400 "Request Header Or Cookie Too Large"（info 级日志，默认 error 级 error.log 无记录）；L1 修复后入口 431 为中间层/后端拦截的透传结果
 
-## 2. 链路阈值对照（哪一侧限制过小）
+## 2. 链路阈值对照（哪一层限制过小）
 | 层 | 模块 | 限制项 | 修改前 | 修改后 |
 |---|------|--------|--------|--------|
 | L1 | nginx（入口反代） | client_header_buffer_size | ${NG_CHB_BEFORE} | ${NG_CHB_KB}k |
@@ -746,20 +823,27 @@ ${ROW_QUOTA}
 
 结论：修复前 nginx 与后端两层阈值均低于上游注入的 header 体量（复现探针 ${TEST_HEADER_BYTES}B），属多模块限制过小。
 
+原故障值口径：业务配额原值 8192（max_header_bytes，随二进制构建固化——改磁盘配置档案重启不生效，须重新编译部署），
+本次已调至 ${APP_QUOTA_MAX}；源码/配置中 8192 的等值书写形态（移码/十六进制）与退役入口存档中的残留常量一并纳入清理
+（本次命中文件：${ORIG_FAULT_FILES:-无}；MaxHeaderBytes 原书写形态：${APP_LIMIT_BEFORE}）。
+
 ## 3. Header 体量归因（谁注入过多）
 ${ATTR_DETAIL}
 - 入口实测（nginx \$request_length）：${ENTRY_LEN}
+- 中间层逐层实测：tracegate 收到 ${GATE_IN:-?}B / 注入后 ${GATE_TRACE_OUT:-?}B（GATESTAT）；meshd 收到 ${MESH_IN:-?}B / 注入后 ${MESH_TRACE_OUT:-?}B（MESHSTAT）
+- 注入量口径：tracegate 每跳追加 gate span ${GATE_SPAN:-?}B；meshd 每跳追加 mesh span ${MESH_SPAN:-?}B + X-Mesh-Baggage ${MESH_BAGGAGE:-?}B —— 后端实际收到的请求头 ≈ 入口探针 + 约 2.9KB 注入，容量评估必须按"后端视角"取值而非入口视角
 
 ## 4. 结论（综合分析）
-1. 431 = 上游模块注入的 header 体量增长 × 链路两侧阈值（nginx 缓冲、后端框架限制）未同步扩容的综合结果；
+1. 431 = 上游模块注入的 header 体量增长 × 链路各层阈值（nginx 缓冲、tracegate 预算、meshd 上限、后端框架限制与业务配额）未同步扩容的综合结果；
 2. 仅修 L1 后入口仍为 ${AFTER_NGINX}（见状态码链），证明单点修复不充分，必须端到端协同治理；
-3. 修复后余量：nginx 单行上限 $(( NG_BUF_KB * 1024 ))B、后端 ${APPLIED_APP_LIMIT}B，均远高于实测体量；
-4. 持续防线：${WARN_RATIO}% 阈值预警 watchdog → warnings.log（431 触发前感知）；quality_gate.sh 对 431 高优先级拦截（exit 2）；阈值单一事实来源 header_limits.env。
+3. 修复后余量：nginx 单行上限 $(( NG_BUF_KB * 1024 ))B、后端 ${APPLIED_APP_LIMIT}B，均远高于实测体量（含各跳注入的增长余量）；
+4. 各层生效语义不同：nginx 热加载、中间层配置重启生效、后端配额随构建固化——"已书写"≠"已生效"，变更后须逐层直连复测；
+5. 持续防线：${WARN_RATIO}% 阈值预警 watchdog → warnings.log（431 触发前感知）；quality_gate.sh 对 431 高优先级拦截（exit 2）；阈值单一事实来源 header_limits.env。
 
 ## 5. 证据与产物
 - 复验记录：/app/ops/last_solve_result.txt
 - nginx 配置：/etc/nginx/nginx.conf（*.solve.bak 为修改前备份）
-- 后端模块：${MOD_DIR}（${L2_KEY} 见 ${WIRE_FILE##*/}）
+- 后端模块：${MOD_DIR}（${L2_KEY} 见 ${WIRE_FILE##*/}）；中间层：/app/tracegate/tracegate.yaml、/app/mesh/sidecar.yaml
 EOF
 say "报告: $REPORT"
 
@@ -770,7 +854,15 @@ after_nginx_status=${AFTER_NGINX}
 baseline_status=${BASELINE}
 final_status=${FINAL}
 direct_status=${DIRECT}
+initial_gate_status=${INITIAL_GATE:-NA}
+final_gate_status=${FINAL_GATE:-NA}
+initial_mesh_status=${INITIAL_MESH:-NA}
+final_mesh_status=${FINAL_MESH:-NA}
+initial_backend_status=${INITIAL_BACKEND:-NA}
+final_backend_status=${FINAL_BACKEND:-NA}
 app_max_header_bytes=${APPLIED_APP_LIMIT}
+gate_max_header_bytes=${GATE_LIMIT:-NA}
+mesh_max_header_bytes=${MESH_LIMIT:-NA}
 nginx_large_header_buffers=${NG_BUF_N}x$(( NG_BUF_KB * 1024 ))B
 quality_gate_exit=${GATE_RC}
 report=diagnosis_report.md
