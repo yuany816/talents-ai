@@ -1,17 +1,11 @@
 schema_version = "1.3"
 
-# 交付物清单（顶层，第一个表头之前）：验题后由平台收集。
-# 路径与题面（期望结果 5）/solution/solve.sh 步骤⑦/tests/test.sh 各检查四处一致，
-# 均为 /app/ops 下四产物（见 instruction.md"产物 schema"）。
-# 注意：本任务验题（tests/test.sh）强依赖任务环境内部状态（nginx -T、/app 源码扫描、
-# 日志截断+reopen、supervisorctl、warnings.log 实时观测），verifier 保持环境内运行
-# （不加 environment_mode="separate"，不建独立 tests/Dockerfile）。
-artifacts = [
-  "/app/ops/header_limits.env",
-  "/app/ops/warnings.log",
-  "/app/ops/quality_gate.sh",
-  "/app/ops/diagnosis_report.md",
-]
+# 独立判分（Harbor 0.23.0，3.8 节）：交付目录整体收集，判分环境按同一绝对路径还原。
+# /app/ops/ 内含四产物（header_limits.env / warnings.log / quality_gate.sh /
+# diagnosis_report.md）与 evidence/ 六个证据文件（nginx_T.txt、curl_entry.txt、
+# curl_backend.txt、upper_boundary.txt、span_count.txt、kafka_audit.txt）——
+# 判分环境不再发起实时探针，全部检查读取交付产物与证据文件（见 tests/test.sh）。
+artifacts = ["/app/ops/"]
 
 [task]
 name = "humanlaya/coding-task"
@@ -27,10 +21,7 @@ memory_mb = 4096
 storage_mb = 10240
 
 [verifier]
-# 有意保持同沙箱（不设 environment_mode="separate"）：验题强依赖容器内现场状态
-# （nginx -T 生效配置、/app 源码与进程、supervisorctl、warnings.log 实时观测）。
-# 实测 separate 模式下 oracle 仅 0.675（入口仍 400/431、buffer 仍 16k），语义错误。
-# 代价是 harbor lint 会保留 1 条 shared-verifier 提示，属已知取舍。
+environment_mode = "separate"   # 独立判分：Harbor 以 tests/ 为构建目录启动判分环境，执行 /tests/test.sh
 timeout_sec = 300
 
 [metadata]

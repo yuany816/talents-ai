@@ -911,7 +911,111 @@ else
   warn "预警观测: 暂未捕获预警（检查 /var/log/backend.log 中 HDRSTAT 与中间件注入状态）"
 fi
 
-# ---------- 步骤⑩：431 综合分析报告（链路级归因，非单点归责） ----------
+# ---------- 步骤⑨.6：独立判分证据落盘（/app/ops/evidence/，artifacts = /app/ops/） ----------
+# Harbor 以 environment_mode="separate" 独立判分：判分环境无服务、不发实时探针，
+# 全部行为证据由本步骤在作答环境采集并按题面"验题契约"的逐文件 schema 落盘
+# （六文件与 tests/checks/* 的断言一一对应）。幂等：每轮覆盖重写。
+say "步骤⑨.6：判分证据落盘（$OPS_DIR/evidence/）"
+EV="$OPS_DIR/evidence"
+mkdir -p "$EV"
+EV_ENTRY="${SCHEME}://127.0.0.1:${PORT}"
+EV_BE="http://127.0.0.1:9000"
+# 大探针经临时 header 文件投递（curl -H @file，7.55+）：规避内核单参数 128KB 上限，
+# 声明 LIM 较大时上边界探针（LIM+4096）也能真实发出
+ev_status() {  # $1=url $2=header_value_bytes（0/空=不带超长头）
+  local url="$1" n="$2" f=/tmp/.ev_hdr
+  if [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null; then
+    head -c "$n" /dev/zero | tr '\0' 'x' > "$f"
+    curl ${CURL_TLS:+"$CURL_TLS"} -s -o /dev/null -w '%{http_code}' --max-time 15 -H "@$f" "$url"
+  else
+    curl ${CURL_TLS:+"$CURL_TLS"} -s -o /dev/null -w '%{http_code}' --max-time 15 "$url"
+  fi
+}
+
+# ① nginx_T.txt：nginx -T 完整输出（含 # configuration file 分节标记）
+nginx -T > "$EV/nginx_T.txt" 2>&1 || warn "nginx -T 失败，证据可能不完整"
+
+# ② curl_entry.txt / curl_backend.txt：端到端探针（状态码/Server/响应体）
+EV_BIG=$TEST_HEADER_BYTES
+ev_hdrfile() { printf 'X-Verify-Token: %s\n' "$(head -c "$1" /dev/zero | tr '\0' 'x')" > /tmp/.ev_hdr; }
+ev_srv="$(curl ${CURL_TLS:+"$CURL_TLS"} -s -D - -o /dev/null --max-time 15 "$EV_ENTRY/api/v1/profile" \
+  | grep -i '^server:' | head -n1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/\r$//')"
+ev_body="$(curl ${CURL_TLS:+"$CURL_TLS"} -s --max-time 15 "$EV_ENTRY/api/v1/profile" | head -n1)"
+ev_hdrfile "$EV_BIG"
+ev_hbody="$(curl ${CURL_TLS:+"$CURL_TLS"} -s --max-time 15 -H @/tmp/.ev_hdr "$EV_ENTRY/healthz" 2>/dev/null | tr -d '[:space:]')"
+cat > "$EV/curl_entry.txt" <<EOF
+entry_big_status=$(ev_status "$EV_ENTRY/api/v1/profile" "$EV_BIG")
+entry_norm_status=$(ev_status "$EV_ENTRY/api/v1/profile" 0)
+healthz_big_status=$(ev_status "$EV_ENTRY/healthz" "$EV_BIG")
+server_header=${ev_srv}
+profile_body=${ev_body}
+healthz_body=${ev_hbody}
+EOF
+ev_hdrfile "$EV_BIG"
+ev_be_body="$(curl -s --max-time 15 -H @/tmp/.ev_hdr "$EV_BE/api/v1/profile" | head -n1)"
+cat > "$EV/curl_backend.txt" <<EOF
+backend_big_status=$(ev_status "$EV_BE/api/v1/profile" "$EV_BIG")
+profile_body=${ev_be_body}
+EOF
+
+# ③ upper_boundary.txt：双侧边界探针（下侧 LIM−1024 须 200，上侧 LIM+4096 须被拒绝）
+EV_LIM=$(( NG_BUF_KB * 1024 ))
+EV_BELOW=$(( EV_LIM - 1024 )); [ "$EV_BELOW" -lt 16384 ] && EV_BELOW=16384
+EV_ABOVE=$(( EV_LIM + 4096 ))
+cat > "$EV/upper_boundary.txt" <<EOF
+declared_lim=${EV_LIM}
+below_probe_bytes=${EV_BELOW}
+below_status=$(ev_status "$EV_ENTRY/api/v1/profile" "$EV_BELOW")
+above_probe_bytes=${EV_ABOVE}
+above_status=$(ev_status "$EV_ENTRY/api/v1/profile" "$EV_ABOVE")
+EOF
+
+# ④ span_count.txt：一次性 nonce 注入链回显 + 逐层精确计数（GATESTAT/MESHSTAT）
+EV_NONCE="vfy$(date +%s%N)"
+EV_ECHO="$(curl ${CURL_TLS:+"$CURL_TLS"} -s -D - -o /dev/null --max-time 15 -H "X-Trace-Context: $EV_NONCE" "$EV_ENTRY/api/v1/profile" 2>/dev/null \
+  | grep -i '^x-trace-context:' | head -n1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/\r$//')"
+GL="$(grep 'GATESTAT' /var/log/tracegate.log 2>/dev/null | grep 'verdict=PASS' | tail -n1)"
+ML="$(grep 'MESHSTAT' /var/log/meshd.log 2>/dev/null | grep 'verdict=PASS' | tail -n1)"
+read -r ev_gi ev_go <<< "$(printf '%s' "$GL" | sed -nE 's/.*trace_in=([0-9]+)B trace_out=([0-9]+)B.*/\1 \2/p')"
+read -r ev_mi ev_mo ev_mbag <<< "$(printf '%s' "$ML" | sed -nE 's/.*trace_in=([0-9]+)B trace_out=([0-9]+)B baggage=([0-9]+)B.*/\1 \2 \3/p')"
+GATE_DELTA=$(( ${ev_go:-0} - ${ev_gi:-0} ))
+MESH_DELTA=$(( ${ev_mo:-0} - ${ev_mi:-0} ))
+cat > "$EV/span_count.txt" <<EOF
+nonce=${EV_NONCE}
+echo=${EV_ECHO}
+gate_trace_delta=${GATE_DELTA}
+mesh_trace_delta=${MESH_DELTA}
+baggage_bytes=${ev_mbag:-0}
+EOF
+
+# ⑤ kafka_audit.txt：kafka 探活 + 组件指纹 + 限额落盘值 + 审计事件标记自证
+EV_KTCP=0
+for _ in 1 2 3; do
+  if timeout 3 bash -c 'exec 3<> /dev/tcp/127.0.0.1/9092' 2>/dev/null; then EV_KTCP=1; break; fi
+  sleep 2
+done
+EV_MARK="kaf$(date +%s%N)"
+ev_hdrfile "$EV_BIG"
+curl -s -o /dev/null --max-time 15 -H @/tmp/.ev_hdr \
+  -H "X-Case-Marker: $EV_MARK" "$EV_ENTRY/api/v1/profile" 2>/dev/null || true
+EV_AUDIT=missing
+for _ in $(seq 1 9); do
+  sleep 5
+  if grep -q "$EV_MARK" /var/log/trace_events.log 2>/dev/null; then EV_AUDIT=ok; break; fi
+done
+EV_KAF_STATIC="$(grep -E '^message\.max\.bytes=' /opt/kafka/config/kraft/server.properties 2>/dev/null | head -n1 | cut -d= -f2 | tr -dc '0-9')"
+cat > "$EV/kafka_audit.txt" <<EOF
+kafka_tcp=$([ "$EV_KTCP" = "1" ] && echo ok || echo fail)
+tracegate_componentz=$(curl -s --max-time 5 http://127.0.0.1:9100/componentz 2>/dev/null)
+meshd_componentz=$(curl -s --max-time 5 http://127.0.0.1:15001/componentz 2>/dev/null)
+kafka_message_max_bytes=${KAF_MSG_NEW}
+kafka_message_max_bytes_static=${EV_KAF_STATIC:-0}
+audit_event_marker=${EV_MARK}
+audit_event_recorded=${EV_AUDIT}
+EOF
+say "证据落盘: $(ls "$EV" | tr '\n' ' ')"
+
+
 say "步骤⑩：生成 431 综合分析报告"
 
 REPORT="$OPS_DIR/diagnosis_report.md"

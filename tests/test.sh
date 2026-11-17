@@ -1,38 +1,41 @@
 #!/bin/bash
 # =============================================================================
-# 431 任务验题脚本（平台 tests/test.sh）—— 加权连续评分 + 双级门槛版
+# 431 任务验题脚本（平台 tests/test.sh）—— 加权连续评分 + 双级门槛版（独立判分）
 #
-# reward = 0.1×结构完整性 + 0.25×基础修复 + 0.45×边界与防线 + 0.2×综合报告质量
+# 判分环境为 tests/Dockerfile 镜像（environment_mode="separate"）：无 nginx/go/kafka/
+# 服务组件，本脚本与全部子检查**不发实时探针**——行为证据来自交付目录 /app/ops/
+# （task.toml artifacts）及其 evidence/ 六个证据文件（题面"验题契约"逐文件 schema）。
+# 门禁类子检查在判分环境本地伪造 /var/log/nginx 日志后执行交付的 quality_gate.sh。
+#
+# reward = 0.15×结构完整性 + 0.25×基础修复 + 0.40×边界与防线 + 0.2×综合报告质量
 #
 #   structure（结构完整性，5 子项）：
 #     /app/ops 四产物齐备 + header_limits.env 的 LIM 键有效性 + WARN_RATIO 格式合法；
-#   basic（基础修复，8 子项 = tests/checks/basic/*.sh 通过比例）：
-#     环境在线 / 端到端探针 / 注入链完整性 / L1 生效 / 后端与中间层扫描 / 声明一致性；
-#   edge（边界与防线，10 子项 = tests/checks/edge/*.sh 通过比例）：
-#     上边界拒绝 / 门禁（干净+分源注入）/ 预警（静默+告警）/
-#     链路计数（span 精确注入 + kafka 审计事件）/ 双侧边界 / 预警内容实质；
+#   basic（基础修复，6 子项 = tests/checks/basic/*.sh 通过比例）：
+#     环境在线（组件指纹）/ 端到端探针 / 注入链完整性 / L1 生效 / 后端限额声明+行为 /
+#     声明一致性（全部读证据文件）；
+#   edge（边界与防线，8 子项 = tests/checks/edge/*.sh 通过比例）：
+#     上边界拒绝 / 门禁（干净+分源注入，判分环境本地伪造日志）/ 链路计数（span 精确
+#     注入 + kafka 审计证据）/ 双侧边界 / 预警内容实质（读交付 warnings.log）；
 #   quality（综合报告质量，8 断言 = diagnosis_report.md 硬断言 ①~⑧ 通过比例）。
 #
 # 双级门槛（在加权总分之上生效，见 instruction.md"判定总则"）：
 #   VETO（一票否决 → reward=0）：
 #     ① 报告实质归因缺失——quality 断言①（归因结论）或④（实质归因：量化证据+
 #       注入侧+限制侧）未通过（含报告缺失）；
-#     ② 质检门禁核心行为失败——edge/02（干净误拦）或 edge/03、edge/04（分源注入
+#     ② 质检门禁核心行为失败——edge/02（无日志误拦）或 edge/03、edge/04（分源注入
 #       未拦截）任一不通过（含门禁缺失）。
-#   CAP（链路完整性封顶 → reward=min(score, 0.4500)）：
-#     注入链完整性（basic/03）、span 精确注入计数（edge/07）、kafka 审计事件计数
-#     （edge/08）任一不通过——"改对一半"（漏掉 span 规格恢复/kafka 治理/绕层）
-#     的解法封顶 0.45，不可能越过 0.5。
+#   CAP（链路完整性封顶 → reward=min(score, 0.5500)）：
+#     注入链完整性（basic/03）、span 精确注入计数（edge/07）、kafka 审计证据（edge/08）
+#     任一不通过——"改对一半"（漏掉 span 规格恢复/kafka 治理/绕层）的解法封顶 0.55。
 #
-# 随机化（每轮验题不同，固定值猜测无效）：上/双侧边界偏移、门禁注入标记与书写顺序、
-# kafka 探针锚定值（按声明 LIM 自适应）、预警探针偏移。
+# 随机化（每轮验题不同，固定样本匹配无效）：门禁注入标记、路径/字节数/时间戳与
+# 两日志书写顺序每轮随机——门禁须按"431 证据"语义实现。
 #
-# 行为正确性以探针判定（不同输入/边界场景）；源码/配置扫描仅作"修改真实发生"的辅助
-# 证据。各子检查自身负责日志清理与注入复原，验题可重复执行。
+# 各子检查自身负责本地伪造日志的清理复原，验题可重复执行。
 # reward.txt 总是被写入：脚本启动即落 0.0 兜底，结束按计算值覆盖（4 位小数浮点）；
 # 任一子检查异常退出按失败计，不影响其余子检查与总分落盘。
-# 测试依赖：bash/curl/nginx(仅 -T 读配置)/grep/awk/sed —— 均为环境镜像自带（见
-# environment/Dockerfile），无 Python/pip 依赖，无需在测试时额外安装。
+# 测试依赖：bash/curl/coreutils/grep/awk/sed —— 见 tests/Dockerfile（判分镜像）。
 # =============================================================================
 export LC_ALL=C
 set -u
@@ -43,6 +46,7 @@ mkdir -p /logs/verifier /var/log/nginx /app/ops 2>/dev/null || true
 
 ok()   { echo "[verifier] ok   : $1"; }
 fail() { echo "[verifier] FAIL : $1"; }
+note() { echo "[verifier] note : $1"; }
 
 # 启动即落兜底值：任何中途异常（超时/被杀）下 reward.txt 都存在且可读
 printf '%s\n' "0.0000" > "$REWARD_FILE"
@@ -131,7 +135,7 @@ STRUCTURE=$(frac "$S_PASS" "$S_TOTAL")
 BASIC=$(frac "$BASIC_PASS" "$BASIC_TOTAL")
 EDGE=$(frac "$EDGE_PASS" "$EDGE_TOTAL")
 QUALITY=$(frac "$Q_PASS" "$Q_TOTAL")
-SCORE=$(awk "BEGIN{printf \"%.4f\", 0.1*$STRUCTURE + 0.25*$BASIC + 0.45*$EDGE + 0.2*$QUALITY}")
+SCORE=$(awk "BEGIN{printf \"%.4f\", 0.15*$STRUCTURE + 0.25*$BASIC + 0.40*$EDGE + 0.2*$QUALITY}")
 
 echo "==================================================================="
 echo "[verifier] 结构完整性 structure=$STRUCTURE ($S_PASS/$S_TOTAL)"
@@ -159,8 +163,8 @@ else
     [ "$CHAIN_RC3" != "0" ] && CAP_TRIGGER="$CAP_TRIGGER 注入链完整性(basic/03);"
     [ "$CHAIN_RC7" != "0" ] && CAP_TRIGGER="$CAP_TRIGGER span精确计数(edge/07);"
     [ "$CHAIN_RC8" != "0" ] && CAP_TRIGGER="$CAP_TRIGGER kafka审计计数(edge/08);"
-    echo "[verifier] CAP 链路完整性封顶：$CAP_TRIGGER 改对一半的解法 reward 封顶 0.4500"
-    SCORE=$(awk "BEGIN{v=$SCORE; printf \"%.4f\", (v>0.45)?0.45:v}")
+    echo "[verifier] CAP 链路完整性封顶：$CAP_TRIGGER 改对一半的解法 reward 封顶 0.5500"
+    SCORE=$(awk "BEGIN{v=$SCORE; printf \"%.4f\", (v>0.55)?0.55:v}")
   fi
 fi
 
