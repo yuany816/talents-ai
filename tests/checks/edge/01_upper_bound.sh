@@ -3,7 +3,7 @@
 # 400/413/431 均算拒绝）。LIM 缺失或 >1MB 时跳过：exit 3（编排器不计入该维度分母，
 # 不产生白送通过分；声明缺失由 basic/08 与结构维度扣分）。
 set -u
-. "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/../lib.sh"
 load_lim || { note "header_limits.env 缺失，跳过上边界检查"; exit 3; }
 if [ -z "$LIM" ] || [ "$LIM" -le 4096 ] 2>/dev/null || [ "$LIM" -gt 1048576 ] 2>/dev/null; then
   note "LIM 缺失/超 1MB，跳过上边界检查"

@@ -2,7 +2,7 @@
 # basic/01 —— 0) 环境在线：入口/后端可达；中间层组件指纹；kafka 探活（3×2s 重试，容 JVM 慢启）
 # 组件为环境组成部分（防"删除组件降噪"与端口占位桩）。
 set -u
-. "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/../lib.sh"
 PASS=1
 curl -s -o /dev/null --max-time 5 "$ENTRY/" || { fail "入口不可达"; PASS=0; }
 curl -s -o /dev/null --max-time 5 "$UP/" || { fail "后端不可达"; PASS=0; }

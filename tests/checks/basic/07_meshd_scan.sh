@@ -3,7 +3,7 @@
 # 残留原故障值 12288 → 不通过（豁免备份后缀文件）。注意：磁盘配置改了但运行时
 # 仍被 supervisor env 覆盖压制的情形由端到端探针（basic/02）与行为检查判定。
 set -u
-. "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/../lib.sh"
 if grep -rqIE 'max_header_bytes["'"'"':= ]*12288([^0-9]|$)' /app/mesh \
     --exclude='*.bak' --exclude='*.bak.*' --exclude='*.candbak' --exclude='*.orig' \
     --exclude='*.old' --exclude='*.backup' --exclude='*.disabled' 2>/dev/null; then

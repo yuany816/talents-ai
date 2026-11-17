@@ -21,13 +21,16 @@ version = "1.0"
 timeout_sec = 1200         # agent 解题的时间限制（秒），难题建议 900-1200
 
 [environment]
-timeout_sec = 1500
 build_timeout_sec = 600
 cpus = 1
 memory_mb = 4096
 storage_mb = 10240
 
 [verifier]
+# 有意保持同沙箱（不设 environment_mode="separate"）：验题强依赖容器内现场状态
+# （nginx -T 生效配置、/app 源码与进程、supervisorctl、warnings.log 实时观测）。
+# 实测 separate 模式下 oracle 仅 0.675（入口仍 400/431、buffer 仍 16k），语义错误。
+# 代价是 harbor lint 会保留 1 条 shared-verifier 提示，属已知取舍。
 timeout_sec = 300
 
 [metadata]

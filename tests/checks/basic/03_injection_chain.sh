@@ -3,7 +3,7 @@
 # 验题注入一次性 nonce，后端回显的 X-Trace-Context 须按序包含 nonce→gate=→mesh=
 # （真实注入为顺序追加），且回显值较 nonce 增幅 ≥2048B（gate/mesh span 真实落头）。
 set -u
-. "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/../lib.sh"
 PASS=1
 VFY="vfy$(date +%s%N)"
 tc_val=$(curl -s -D - -o /dev/null --max-time 10 -H "X-Trace-Context: $VFY" "$ENTRY/api/v1/profile" \

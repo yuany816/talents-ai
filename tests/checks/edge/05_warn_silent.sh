@@ -3,7 +3,7 @@
 # 声明值超出 [50,90] → 不通过）；清理 hdrsize.log 后发送常规请求（远低于阈值），
 # 10s 内 warnings.log 行数不得增加（不得误报）。
 set -u
-. "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/../lib.sh"
 ensure_ops_dir
 [ -f "$LIMENV" ] || { fail "缺少预警参数文件 $LIMENV"; exit 1; }
 LIM=$(sed -n 's/^NGINX_LARGE_HEADER_BUFFER_BYTES=//p' "$LIMENV" | head -n1 | tr -dc '0-9')

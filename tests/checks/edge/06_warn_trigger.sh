@@ -4,7 +4,7 @@
 # 观测到）。THRESH = LIM×RATIO/100；RATIO∈[50,90] 保证探针越过阈值且不越过上限
 # （范围越界已在 edge/05 判定，此处仅按 80 兜底计算）。
 set -u
-. "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/../lib.sh"
 ensure_ops_dir
 [ -f "$LIMENV" ] || { fail "缺少预警参数文件 $LIMENV"; exit 1; }
 LIM=$(sed -n 's/^NGINX_LARGE_HEADER_BUFFER_BYTES=//p' "$LIMENV" | head -n1 | tr -dc '0-9')

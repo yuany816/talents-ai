@@ -3,7 +3,7 @@
 # 追加一行含 client sent too long header line 的 info 级记录，门禁必须 exit ≠ 0。
 # 门禁在 hdrsize.log 缺失时应跳过该来源（不得因此误拦或崩溃）。注入后清理复原。
 set -u
-. "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/../lib.sh"
 [ -x "$GATE" ] || { fail "缺少质检门禁 $GATE"; exit 1; }
 [ -f /var/log/nginx/hdrsize.log ] && echo "$(date +%s).000 431 99999 \"GET /injected HTTP/1.1\"" >> /var/log/nginx/hdrsize.log
 echo "$(date '+%Y/%m/%d %H:%M:%S') [info] 999#999: *1 client sent too long header line while reading client request headers, client: 127.0.0.1, server: _, request: \"GET /injected HTTP/1.1\"" >> /var/log/nginx/error.log

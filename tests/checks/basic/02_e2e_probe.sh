@@ -2,7 +2,7 @@
 # basic/02 —— 1) 端到端（多路由/多层）：16384B 单自定义 header 探针与常规请求行为一致；
 # Server: nginx（防绕过反代）；响应体特征（防"永远 200"桩替换）。
 set -u
-. "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/../lib.sh"
 PASS=1
 big=$(gen_token "$PROBE_BYTES")
 
