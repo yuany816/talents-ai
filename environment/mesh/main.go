@@ -1,8 +1,9 @@
 // meshd —— service mesh 数据面 sidecar（模拟 Envoy 形态，随业务实例部署）。
 //
 // 职责（链路第 3 层）：
-//   1) header 上限检查：请求头总量超过 max_header_bytes 时返回 431（响应体携带
-//      component 字段便于逐层定位）；
+//   1) header 上限检查：请求头总量超过生效限额时返回 431（响应体携带
+//      component 字段便于逐层定位）；限额来源优先级：部署环境（MESH_HEADER_LIMIT，
+//      rollout v2417 起控制面经 supervisord 注入）> sidecar.yaml；
 //   2) mesh 注入：在 X-Trace-Context 追加一段恰为 span_bytes 字符的 mesh span；
 //      并写入恰为 baggage_bytes 字符的 X-Mesh-Baggage 头（控制面下发的传播负载）；
 //   3) 反向代理到本实例业务容器（backend :9000）。
@@ -30,6 +31,8 @@ type meshConfig struct {
 	MaxHeaderBytes int
 	SpanBytes      int
 	BaggageBytes   int
+	// LimitSource 生效限额的来源标签（yaml / env 覆盖），启动日志打印供运行时核验
+	LimitSource string
 }
 
 func loadConfig(path string) meshConfig {
@@ -67,6 +70,7 @@ func loadConfig(path string) meshConfig {
 	if cfg.Listen == "" || cfg.Upstream == "" || cfg.MaxHeaderBytes <= 0 || cfg.SpanBytes <= 0 {
 		log.Fatalf("配置 %s 字段无效: %+v", path, cfg)
 	}
+	cfg.LimitSource = "sidecar.yaml"
 	return cfg
 }
 
@@ -122,6 +126,19 @@ func reject431(w http.ResponseWriter, component string, limit, observed int) {
 func main() {
 	cfg := loadConfig("sidecar.yaml")
 
+	// 运行时覆盖（rollout v2417 引入）：控制面经部署编排（supervisord program
+	// environment）下发 MESH_HEADER_LIMIT，优先级高于 sidecar.yaml。磁盘配置与
+	// 生效值可能因此不一致——"已书写"≠"已生效"，以启动日志打印的 source 为准。
+	yamlLimit := cfg.MaxHeaderBytes
+	if v := os.Getenv("MESH_HEADER_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			cfg.MaxHeaderBytes = n
+			cfg.LimitSource = "env:MESH_HEADER_LIMIT(overrides sidecar.yaml)"
+		} else {
+			log.Printf("meshd: MESH_HEADER_LIMIT=%q 非法，忽略（继续使用 sidecar.yaml）", v)
+		}
+	}
+
 	up, err := url.Parse(cfg.Upstream)
 	if err != nil {
 		log.Fatalf("upstream 无效: %v", err)
@@ -169,6 +186,7 @@ func main() {
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 	}
-	log.Printf("meshd listening on %s (limit=%dB span=%dB baggage=%dB upstream=%s)", cfg.Listen, cfg.MaxHeaderBytes, cfg.SpanBytes, cfg.BaggageBytes, cfg.Upstream)
+	log.Printf("meshd listening on %s limit=%dB (source=%s, yaml_limit=%dB) span=%dB baggage=%dB upstream=%s",
+		cfg.Listen, cfg.MaxHeaderBytes, cfg.LimitSource, yamlLimit, cfg.SpanBytes, cfg.BaggageBytes, cfg.Upstream)
 	log.Fatal(srv.ListenAndServe())
 }

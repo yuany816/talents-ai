@@ -6,7 +6,9 @@
 #           Fields Too Large，同步链路故障在四层：
 #             L1 nginx：snippets/headers.conf 缓冲过小（8k / 4 16k）
 #             L2 tracegate：接入网关 trace 插件 header 预算过小（10240，配置驱动）
-#             L3 meshd：mesh 数据面 sidecar max_header_bytes 过小（12288，配置驱动）
+#             L3 meshd：mesh 数据面 sidecar max_header_bytes 过小（12288，配置驱动），
+#                        且部署编排（supervisor environment=MESH_HEADER_LIMIT）存在运行时
+#                        覆盖，优先级高于磁盘 yaml——须对齐 supervisor 配置并 reread/update
 #             L4 backend：net/http MaxHeaderBytes(1<<13) + go:embed 固化的业务配额(8192)
 #                        （需改源码/配置并重新编译打包）
 #           异步旁路：backend → Kafka(message.max.bytes=16384 过小) → trace-collector；
@@ -59,6 +61,7 @@ EDITED_FILES=""; MAIN_GO_FILES=""; NG_LOGS=""
 NG_CHB_BEFORE="未配置(默认1k)"; NG_BUF_BEFORE="未配置(默认4 8k)"
 APP_LIMIT_BEFORE="未知"; APP_KIND=""; WIRE_FILE=""; MID_FILE=""; MID_WIRED=0
 APP_QUOTA_MAX=1048576; QUOTA_APPLIED=0; QUOTA_BEFORE=""
+SUP_CONF=""; MESH_ENV_PATCHED=0; ORIG_MESH_ENV=""; MESH_ENV_BEFORE=""
 
 say()  { echo "[solve.sh] $*"; }
 warn() { echo "[solve.sh][WARN] $*" >&2; }
@@ -155,6 +158,9 @@ NG_LOGS="$(grep -rhE '^[[:space:]]*(access_log|error_log)[[:space:]]' /etc/nginx
 /var/log/nginx/error.log
 /var/log/nginx/access.log
 /var/log/nginx/hdrsize.log"
+
+# supervisord 程序配置（各组件运行时环境的单一事实来源；E3 层运行时覆盖见 4.6）
+SUP_CONF="$(grep -rlE '^\[program:meshd\]' /etc/supervisor /etc/supervisord* /etc/supervisor.d 2>/dev/null | head -n1)"
 
 # 若 supervisord 未运行（solve 作为容器入口先于编排启动的场景），先拉起编排
 if command -v supervisorctl >/dev/null 2>&1 && ! supervisorctl status >/dev/null 2>&1; then
@@ -378,6 +384,31 @@ if [ -n "$RESIDUAL_8192" ]; then
     sed -i -E 's/(^|[^0-9])8192([^0-9]|$)/\11048576\2/g' "$rf"
     say ">> 原故障值残留已清理: $rf（8192 → 1048576）"
   done
+fi
+
+# 4.6 部署环境运行时覆盖对齐（L3 meshd）：
+#     meshd 的生效限额可被 supervisord program environment（MESH_HEADER_LIMIT，rollout
+#     v2417 控制面下发）覆盖，优先级高于磁盘 sidecar.yaml——仅改 yaml + restart 时
+#     生效值仍为 env 覆盖值（"已书写"≠"已生效"）。此处幂等对齐 supervisor 配置；
+#     变更须 supervisorctl reread && update 被编排进程接管后随重启生效（步骤⑥）。
+MESH_ENV_PATCHED=0
+if [ -n "$SUP_CONF" ] && grep -qE '^\[program:meshd\]' "$SUP_CONF" 2>/dev/null; then
+  ORIG_MESH_ENV="$(grep -oE 'MESH_HEADER_LIMIT="?[0-9]+' "$SUP_CONF" | head -n1 | grep -oE '[0-9]+$' || true)"
+  backup "$SUP_CONF"
+  if grep -qE '^[[:space:]]*environment[[:space:]]*=' "$SUP_CONF" && grep -q 'MESH_HEADER_LIMIT' "$SUP_CONF"; then
+    sed -i -E "s/(environment[[:space:]]*=.*)MESH_HEADER_LIMIT=\"?[0-9]+\"?/\1MESH_HEADER_LIMIT=\"${APP_QUOTA_MAX}\"/" "$SUP_CONF"
+  else
+    sed -i "/^\[program:meshd\]/a environment=MESH_HEADER_LIMIT=\"${APP_QUOTA_MAX}\"" "$SUP_CONF"
+  fi
+  if grep -qE "MESH_HEADER_LIMIT=\"?${APP_QUOTA_MAX}\"?" "$SUP_CONF"; then
+    MESH_ENV_PATCHED=1
+    say ">> meshd 运行时覆盖已对齐: ${SUP_CONF##*/} MESH_HEADER_LIMIT=${ORIG_MESH_ENV:-未设置} → ${APP_QUOTA_MAX}"
+  else
+    warn "supervisor 环境覆盖对齐未确认，请人工检查 $SUP_CONF（meshd 生效限额或仍被 env 压制）"
+  fi
+else
+  ORIG_MESH_ENV=""
+  warn "未定位 [program:meshd] 的 supervisord 配置——若 meshd 生效限额仍异常请人工核查部署环境"
 fi
 
 # 4.4 注入逐 header 体积统计中间件（归因观测：哪个模块/header 注入过多）
@@ -654,9 +685,17 @@ if [ "$SOURCE_CHANGED" = "1" ] || [ "$CONFIG_CHANGED" = "1" ]; then
   fi
   # 中间层组件（tracegate/meshd）的限额配置在进程启动时读取：配置有改动时一并重启
   # 方可生效（后端配额是构建期固化，走二进制替换；各层生效语义不同，见综合报告）。
-  if [ "$CHAIN_CFG_CHANGED" = "1" ] && command -v supervisorctl >/dev/null 2>&1 && supervisorctl status >/dev/null 2>&1; then
+  # supervisor program environment 有改动时：先 reread && update 交编排进程接管
+  # （update 对变更程序自动重启），仅 restart 不会重读 supervisord 配置。
+  if { [ "$CHAIN_CFG_CHANGED" = "1" ] || [ "$MESH_ENV_PATCHED" = "1" ]; } \
+     && command -v supervisorctl >/dev/null 2>&1 && supervisorctl status >/dev/null 2>&1; then
+    if [ "$MESH_ENV_PATCHED" = "1" ]; then
+      timeout 30 supervisorctl reread >/dev/null 2>&1 || true
+      timeout 60 supervisorctl update >/dev/null 2>&1 || true
+      say "supervisord 已 reread/update（program environment 接管）"
+    fi
     if timeout 60 supervisorctl restart tracegate meshd >/dev/null 2>&1; then
-      say "中间层组件已重启（tracegate/meshd 配置生效）"
+      say "中间层组件已重启（tracegate/meshd 配置与运行时覆盖生效）"
     else
       warn "tracegate/meshd 重启失败，请人工确认 supervisorctl 程序名"
     fi
@@ -712,9 +751,16 @@ if [ -f "$OPS_DIR/header_limits.env" ]; then
   _o2="$(sed -n 's/^ORIG_NG_BUF=//p'  "$OPS_DIR/header_limits.env" | head -n1 | tr -d '"')"; [ -n "$_o2" ] && NG_BUF_BEFORE="$_o2"
   _o3="$(sed -n 's/^ORIG_APP_LIMIT=//p' "$OPS_DIR/header_limits.env" | head -n1 | tr -d '"')"; [ -n "$_o3" ] && APP_LIMIT_BEFORE="$_o3"
   _o4="$(sed -n 's/^ORIG_APP_QUOTA=//p' "$OPS_DIR/header_limits.env" | head -n1 | tr -d '"')"; [ -n "$_o4" ] && QUOTA_BEFORE="$_o4"
+  _o5="$(sed -n 's/^ORIG_MESH_ENV=//p' "$OPS_DIR/header_limits.env" | head -n1 | tr -d '"')"; [ -n "$_o5" ] && MESH_ENV_BEFORE="$_o5"
 fi
+[ -z "$MESH_ENV_BEFORE" ] && MESH_ENV_BEFORE="${ORIG_MESH_ENV:-}"
 GATE_LIMIT="$(grep -hE '^max_header_bytes:' /app/tracegate/tracegate.yaml 2>/dev/null | head -n1 | grep -oE '[0-9]+$')"
-MESH_LIMIT="$(grep -hE '^max_header_bytes:' /app/mesh/sidecar.yaml 2>/dev/null | head -n1 | grep -oE '[0-9]+$')"
+# meshd 生效限额 = 部署环境覆盖（若存在）否则磁盘 yaml——与组件启动日志 source 字段同口径
+MESH_LIMIT=""
+if [ -n "$SUP_CONF" ]; then
+  MESH_LIMIT="$(grep -oE 'MESH_HEADER_LIMIT="?[0-9]+' "$SUP_CONF" 2>/dev/null | head -n1 | grep -oE '[0-9]+$')"
+fi
+[ -z "$MESH_LIMIT" ] && MESH_LIMIT="$(grep -hE '^max_header_bytes:' /app/mesh/sidecar.yaml 2>/dev/null | head -n1 | grep -oE '[0-9]+$')"
 cat > "$OPS_DIR/header_limits.env" <<EOF
 # solve.sh 生成 —— 全链路 header 限额与预警参数（单一事实来源）
 NGINX_CLIENT_HEADER_BUFFER_BYTES=$(( NG_CHB_KB * 1024 ))
@@ -723,6 +769,7 @@ NGINX_LARGE_HEADER_BUFFER_BYTES=$(( NG_BUF_KB * 1024 ))
 APP_MAX_HEADER_BYTES=$(( QUOTA_APPLIED == 1 ? APP_QUOTA_MAX : APPLIED_APP_LIMIT ))
 TRACEGATE_MAX_HEADER_BYTES=${GATE_LIMIT:-}
 MESH_MAX_HEADER_BYTES=${MESH_LIMIT:-}
+MESH_LIMIT_SOURCE=$([ "$MESH_ENV_PATCHED" = "1" ] && echo "supervisor-env" || echo "sidecar.yaml")
 KAFKA_MESSAGE_MAX_BYTES=${KAF_MSG_NEW}
 WARN_RATIO=${WARN_RATIO}
 ENTRY_URL=${ENTRY_URL}
@@ -731,6 +778,7 @@ ORIG_NG_CHB="${NG_CHB_BEFORE}"
 ORIG_NG_BUF="${NG_BUF_BEFORE}"
 ORIG_APP_LIMIT="${APP_LIMIT_BEFORE}"
 ORIG_APP_QUOTA="${QUOTA_BEFORE}"
+ORIG_MESH_ENV="${MESH_ENV_BEFORE}"
 ORIG_KAFKA_MSG="${KAF_MSG_BEFORE}"
 EOF
 
@@ -896,9 +944,13 @@ ${ROW_QUOTA}
 本次已调至 ${APP_QUOTA_MAX}；源码/配置中 8192 的等值书写形态（移码/十六进制）与退役入口存档中的残留常量一并纳入清理
 （本次命中文件：${ORIG_FAULT_FILES:-无}；MaxHeaderBytes 原书写形态：${APP_LIMIT_BEFORE}）。
 
-中间层原故障值口径：tracegate（接入网关 trace 插件）max_header_bytes 原值 10240、
-meshd（mesh 数据面 sidecar）max_header_bytes 原值 12288——均为配置驱动（进程启动时
-读取，修改后重启对应组件即生效），本次已统一调至 ${APP_QUOTA_MAX}（逐项修改前值见上表）。
+中间层原故障值口径：tracegate（接入网关 trace 插件）max_header_bytes 原值 10240（配置驱动，
+进程启动时读取，修改后重启对应组件即生效）；meshd（mesh 数据面 sidecar）磁盘配置原值 12288，
+且部署编排存在运行时覆盖 MESH_HEADER_LIMIT（supervisord program environment，rollout v2417
+控制面下发，优先级高于 sidecar.yaml——仅改 yaml 并 restart 时生效值仍为覆盖值，"已书写"≠
+"已生效"），本次已将磁盘配置与运行时覆盖统一调至 ${APP_QUOTA_MAX}（supervisor 变更经
+reread && update 被编排进程接管后随重启生效；覆盖原值 ${MESH_ENV_BEFORE:-未设置}；
+逐项修改前值见上表）。
 
 ## 3. Header 体量归因（谁注入过多）
 ${ATTR_DETAIL}
@@ -943,6 +995,9 @@ final_backend_status=${FINAL_BACKEND:-NA}
 app_max_header_bytes=${APPLIED_APP_LIMIT}
 gate_max_header_bytes=${GATE_LIMIT:-NA}
 mesh_max_header_bytes=${MESH_LIMIT:-NA}
+mesh_env_override_before=${MESH_ENV_BEFORE:-NA}
+mesh_env_override_after=${MESH_LIMIT:-NA}
+mesh_env_patched=${MESH_ENV_PATCHED}
 kafka_message_max_bytes=${KAF_MSG_NEW}
 kafka_message_max_bytes_before=${KAF_MSG_BEFORE:-NA}
 kafka_altered_dynamic=${KAF_ALTERED}

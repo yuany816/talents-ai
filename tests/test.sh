@@ -1,229 +1,121 @@
 #!/bin/bash
-# 431 任务验题脚本（平台 tests/test.sh）
-# 判定：端到端 + 双层真实修改（防伪造）+ 边界/输入覆盖 + 防线（门禁/预警）+ 综合归因报告
-# 行为正确性以探针（不同输入/边界）判定；源码/配置扫描仅作"修改真实发生"的辅助证据。
+# =============================================================================
+# 431 任务验题脚本（平台 tests/test.sh）—— 加权连续评分版
+#
+# reward = 0.2×结构完整性 + 0.3×基础修复 + 0.3×边界与防线 + 0.2×综合报告质量
+#
+#   structure（结构完整性，5 子项各 0.2）：
+#     /app/ops 四产物齐备 + header_limits.env 的 LIM 键有效性 + WARN_RATIO 格式合法；
+#   basic（基础修复，8 子项 = tests/checks/basic/*.sh 通过比例）：
+#     环境在线 / 端到端探针 / 注入链完整性 / L1 生效 / 后端与中间层扫描 / 声明一致性；
+#   edge（边界与防线，6 子项 = tests/checks/edge/*.sh 通过比例）：
+#     上边界拒绝 / 门禁（干净+分源注入）/ 预警（静默+告警）；
+#   quality（综合报告质量，7 子项 = diagnosis_report.md 硬断言 ①~⑦ 通过比例）。
+#
+# 行为正确性以探针判定（不同输入/边界场景）；源码/配置扫描仅作"修改真实发生"的辅助
+# 证据。各子检查自身负责日志清理与注入复原，验题可重复执行。
+# reward.txt 总是被写入：脚本启动即落 0.0 兜底，结束按计算值覆盖（4 位小数浮点）；
+# 任一子检查异常退出按失败计，不影响其余子检查与总分落盘。
 # 测试依赖：bash/curl/nginx(仅 -T 读配置)/grep/awk/sed —— 均为环境镜像自带（见
 # environment/Dockerfile），无 Python/pip 依赖，无需在测试时额外安装。
-# 评分策略（3.7）：全部检查为硬性必要条件，采用 0/1 二值判定（无加权部分分）——
-# 任一检查失败即 reward=0，通过即 1；题面"判定总则"已声明该语义。reward.txt 总是被
-# 覆盖写入（0 或 1），不存在留空或沿用上次结果（3.5）。
+# =============================================================================
+export LC_ALL=C
+set -u
+
 REWARD_FILE="/logs/verifier/reward.txt"
-mkdir -p /logs/verifier /var/log/nginx
-PASS=1
+TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+mkdir -p /logs/verifier /var/log/nginx /app/ops 2>/dev/null || true
+
 ok()   { echo "[verifier] ok   : $1"; }
-fail() { echo "[verifier] FAIL : $1"; PASS=0; }
+fail() { echo "[verifier] FAIL : $1"; }
 
-ENTRY="http://127.0.0.1:80"
-UP="http://127.0.0.1:9000"
-PROBE_BYTES=16384
-big=$(head -c $PROBE_BYTES /dev/zero | tr '\0' 'x')
+# 启动即落兜底值：任何中途异常（超时/被杀）下 reward.txt 都存在且可读
+printf '%s\n' "0.0000" > "$REWARD_FILE"
 
-# ---------- 0) 环境在线 ----------
-curl -s -o /dev/null --max-time 5 "$ENTRY/" || fail "入口不可达"
-curl -s -o /dev/null --max-time 5 "$UP/" || fail "后端不可达"
-# 中间层与 Kafka 为环境组成部分（防"删除组件降噪"与端口占位桩）：
-# /componentz 由组件本地应答、携带组件名指纹；kafka 为 JVM 慢启组件，探活带 3×2s 重试。
-TG="http://127.0.0.1:9100"; MS="http://127.0.0.1:15001"
-curl -s -o /dev/null --max-time 5 "$TG/componentz" || fail "tracegate(9100) 不可达"
-curl -s -o /dev/null --max-time 5 "$MS/componentz" || fail "meshd(15001) 不可达"
-curl -s --max-time 5 "$TG/componentz" | grep -q '"tracegate"' \
-  && ok "tracegate(9100) 组件指纹匹配" || fail "9100 非预期服务（缺 tracegate 组件指纹）"
-curl -s --max-time 5 "$MS/componentz" | grep -q '"meshd"' \
-  && ok "meshd(15001) 组件指纹匹配" || fail "15001 非预期服务（缺 meshd 组件指纹）"
-kafka_ok=0
-for _ in 1 2 3; do
-  if timeout 3 bash -c 'exec 3<> /dev/tcp/127.0.0.1/9092' 2>/dev/null; then kafka_ok=1; break; fi
-  sleep 2
-done
-[ "$kafka_ok" = "1" ] && ok "kafka(9092) 端口在线" || fail "kafka(9092) 不可达"
-
-# ---------- 1) 端到端：超长 header 与常规请求行为一致（多路由/多层） ----------
-entry_big=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "X-Verify-Token: $big" "$ENTRY/api/v1/profile")
-entry_norm=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$ENTRY/api/v1/profile")
-[ "$entry_big" = "200" ] && ok "入口超长header → 200" || fail "入口超长header → $entry_big"
-[ "$entry_norm" = "200" ] && ok "入口常规请求 → 200" || fail "入口常规请求 → $entry_norm"
-health_big=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "X-Verify-Token: $big" "$ENTRY/healthz")
-[ "$health_big" = "200" ] && ok "入口/healthz超长header → 200" || fail "入口/healthz超长header → $health_big"
-direct=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "X-Verify-Token: $big" "$UP/api/v1/profile")
-[ "$direct" = "200" ] && ok "直连后端超长header → 200" || fail "直连后端超长header → $direct"
-srv=$(curl -s -D - -o /dev/null --max-time 10 "$ENTRY/api/v1/profile" | grep -i '^server:' | head -n1)
-echo "$srv" | grep -qi nginx && ok "入口为 nginx 反代" || fail "入口响应缺 Server: nginx"
-# 链路完整性（防"绕过中间层直连下游"与"静态伪造注入段"式伪修复）：验题注入一次性
-# nonce，后端回显的 X-Trace-Context 须按序包含 nonce→gate=→mesh=（真实注入为顺序
-# 追加），且回显值较 nonce 增幅 ≥2048B（gate/mesh span 真实落头）。静态 add_header
-# 无法预知 nonce；绕过中间层则无注入段。
-VFY="vfy$(date +%s%N)"
-tc_val=$(curl -s -D - -o /dev/null --max-time 10 -H "X-Trace-Context: $VFY" "$ENTRY/api/v1/profile" \
-  | grep -i '^x-trace-context:' | head -n1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/\r$//')
-case "$tc_val" in
-  *"$VFY"*"gate="*"mesh="*) ok "注入链完整（X-Trace-Context 回显 nonce→gate→mesh 有序追加）" ;;
-  *) fail "注入链不完整或伪造（回显缺 nonce/gate=/mesh= 有序段——疑似绕过中间层）" ;;
-esac
-if [ "${#tc_val}" -ge $(( ${#VFY} + 2048 )) ]; then
-  ok "注入链增幅达标（回显 ${#tc_val}B，span 追加 ≥2048B）"
-else
-  fail "注入链增幅不足（回显 ${#tc_val}B，gate/mesh span 未真实落头）"
-fi
-# 响应体特征（防"桩替换"式作弊：必须是真实应用在服务，而非只回 200 的替身）
-body=$(curl -s --max-time 10 "$ENTRY/api/v1/profile")
-echo "$body" | grep -q '"msg":"ok"' && ok "业务路由响应体特征匹配" || fail "业务路由响应体异常（疑似应用被替换）"
-hb=$(curl -s --max-time 10 -H "X-Verify-Token: $big" "$ENTRY/healthz" | tr -d '[:space:]')
-[ "$hb" = "ok" ] && ok "/healthz 响应体特征匹配" || fail "/healthz 响应体异常（疑似应用被替换）"
-
-# ---------- 2) 双层真实修改（防伪造辅助证据；行为判定见 1/3 节） ----------
-# L1 下限 17408B = 16384B（探针值）+ 字段名/分隔符/CRLF（约 18B）+ 1024B 余量，
-# 按完整 header 行口径计算——恰好 16384 的缓冲会误拒合规探针。
-NG_BUF=$(nginx -T 2>/dev/null | grep -E '^[[:space:]]*large_client_header_buffers[[:space:]]' | head -n1 | awk '{gsub(/;/,""); print $3}')
-NG_BUF_B=$(printf '%s' "$NG_BUF" | awk '{v=$1; if (v ~ /[kK]$/) {sub(/[kK]$/,"",v); print v*1024} else if (v ~ /[mM]$/) {sub(/[mM]$/,"",v); print v*1048576} else print v}')
-if [ -n "$NG_BUF_B" ] && [ "$NG_BUF_B" -ge 17408 ] 2>/dev/null; then
-  ok "nginx large_client_header_buffers=${NG_BUF}（生效配置，完整行口径 ≥17408B）"
-else
-  fail "nginx header 缓冲未调大（当前=${NG_BUF:-无}，需按完整 header 行口径 ≥17408B）"
-fi
-# L2 扫描按关键词锚定 + 十进制全量两种口径：
-# - 十进制形态 (^|[^0-9])8192([^0-9]|$) 不限上下文（覆盖业务配额键、退役入口常量等任意书写处）；
-# - 等值移码/十六进制形态（1 << 13 / 0x2000）仅锚定 MaxHeaderBytes/max_header_bytes 上下文，
-#   避免误伤无关代码中的位移/十六进制常量；数值有效性由检查 1/3 的行为探针证明。
-if grep -rqIE '(^|[^0-9])8192([^0-9]|$)|(MaxHeaderBytes|max_header_bytes)["'\'':= ]*(1[[:space:]]*<<[[:space:]]*13([^0-9]|$)|0[xX]2000([^0-9a-fA-F]|$))' /app/backend \
-    --exclude='*.bak' --exclude='*.bak.*' --exclude='*.candbak' --exclude='*.orig' \
-    --exclude='*.old' --exclude='*.backup' --exclude='*.disabled' 2>/dev/null; then
-  fail "后端侧 header 限额仍残留原故障值 8192（十进制或等值移码/十六进制形态，源码/配置）"
-else
-  ok "后端侧 header 限额已真实调整（源码/配置扫描）"
-fi
-# 中间层组件限额为配置驱动（进程启动时读取），同机制镜像扫描（键上下文锚定，
-# 不误伤无关数值；行为探针为主要判定，扫描为辅助证据）。
-scan_fault() {  # $1=故障值 $2=目录 $3=标签
-  if grep -rqIE "max_header_bytes[\"':= ]*$1([^0-9]|$)" "$2" \
-      --exclude='*.bak' --exclude='*.bak.*' --exclude='*.candbak' --exclude='*.orig' \
-      --exclude='*.old' --exclude='*.backup' --exclude='*.disabled' 2>/dev/null; then
-    fail "$3 侧 header 限额仍残留原故障值 $1（max_header_bytes 键上下文，源码/配置）"
-  else
-    ok "$3 侧 header 限额已真实调整（源码/配置扫描）"
-  fi
-}
-scan_fault 10240 /app/tracegate tracegate
-scan_fault 12288 /app/mesh meshd
-
-# ---------- 3) 边界与输入覆盖（以解题者声明的限额为基准） ----------
-LIMENV="/app/ops/header_limits.env"
+# ---------- dimension: structure（交付物结构完整性，5 子项） ----------
+S_PASS=0; S_TOTAL=5
+[ -s /app/ops/header_limits.env ] && { ok "结构 1/5：header_limits.env 存在且非空"; S_PASS=$((S_PASS+1)); } \
+  || fail "结构 1/5：header_limits.env 缺失或为空"
+[ -x /app/ops/quality_gate.sh ] && { ok "结构 2/5：quality_gate.sh 存在且可执行"; S_PASS=$((S_PASS+1)); } \
+  || fail "结构 2/5：quality_gate.sh 缺失或不可执行"
+[ -s /app/ops/diagnosis_report.md ] && { ok "结构 3/5：diagnosis_report.md 存在且非空"; S_PASS=$((S_PASS+1)); } \
+  || fail "结构 3/5：diagnosis_report.md 缺失或为空"
 LIM=""
-if [ -f "$LIMENV" ]; then
-  LIM=$(sed -n 's/^NGINX_LARGE_HEADER_BUFFER_BYTES=//p' "$LIMENV" | head -n1 | tr -dc '0-9')
-  # 3.1 声明一致性：LIM 必须与 nginx 生效单缓冲一致（k/M 折算后相等）
-  if [ -n "$LIM" ] && [ -n "$NG_BUF_B" ] && [ "$LIM" -eq "$NG_BUF_B" ] 2>/dev/null; then
-    ok "声明 LIM 与 nginx 生效单缓冲一致（${LIM}B）"
-  else
-    fail "声明 LIM(${LIM:-缺}) 与 nginx 生效单缓冲(${NG_BUF_B:-无}) 不一致"
-  fi
-  # 3.2 上边界：超过声明上限的请求必须仍被拒绝（限额语义仍在，而非一放了之）
-  if [ -n "$LIM" ] && [ "$LIM" -gt 4096 ] && [ "$LIM" -le 1048576 ]; then
-    over=$(( LIM + 4096 ))
-    obig=$(head -c $over /dev/zero | tr '\0' 'x')
-    over_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "X-Verify-Token: $obig" "$ENTRY/api/v1/profile")
-    case "$over_code" in
-      200|000) fail "超上限请求未被拒绝（status=$over_code）" ;;
-      *)       ok "超上限请求仍被拒绝（status=$over_code）" ;;
+if [ -f /app/ops/header_limits.env ]; then
+  LIM=$(sed -n 's/^NGINX_LARGE_HEADER_BUFFER_BYTES=//p' /app/ops/header_limits.env | head -n1 | tr -dc '0-9')
+fi
+if [ -n "$LIM" ] && [ "$LIM" -gt 4096 ] 2>/dev/null; then
+  ok "结构 4/5：NGINX_LARGE_HEADER_BUFFER_BYTES 声明有效（${LIM}B > 4096）"; S_PASS=$((S_PASS+1))
+else
+  fail "结构 4/5：NGINX_LARGE_HEADER_BUFFER_BYTES 缺失（或 ≤4096，低于旧故障值一半属未有效扩容）"
+fi
+RATIO=""
+[ -f /app/ops/header_limits.env ] && RATIO=$(sed -n 's/^WARN_RATIO=//p' /app/ops/header_limits.env | head -n1 | tr -dc '0-9')
+if [ -z "$RATIO" ] && [ -f /app/ops/header_limits.env ]; then
+  ok "结构 5/5：WARN_RATIO 缺失（按 80 处理）"; S_PASS=$((S_PASS+1))
+elif [ -n "$RATIO" ] && [ "$RATIO" -ge 50 ] 2>/dev/null && [ "$RATIO" -le 90 ] 2>/dev/null; then
+  ok "结构 5/5：WARN_RATIO=$RATIO 格式有效"; S_PASS=$((S_PASS+1))
+else
+  fail "结构 5/5：WARN_RATIO 未声明（参数文件缺失）或非法（有效范围 [50,90]；范围越界对行为的影响由 edge/05 判定）"
+fi
+
+# ---------- dimension: basic / edge（子检查目录按字典序逐个执行） ----------
+run_dim() {  # $1=checks 子目录名；结果写入 BASIC_PASS/BASIC_TOTAL 或 EDGE_PASS/EDGE_TOTAL
+  local dim="$1" dir="$TESTS_DIR/checks/$1" f base pass=0 total=0
+  for f in $(ls "$dir"/*.sh 2>/dev/null | sort); do
+    base=$(basename "$f")
+    echo "----- [$dim/$base] -----"
+    bash "$f"; rc=$?
+    case $rc in
+      0) ok "$dim/$base 通过"; pass=$((pass + 1)); total=$((total + 1)) ;;
+      3) note "$dim/$base 跳过（不计入维度分母）" ;;
+      *) fail "$dim/$base 不通过"; total=$((total + 1)) ;;
     esac
-  else
-    echo "[verifier] note : LIM 缺失/超 1MB，跳过上边界检查"
-  fi
-else
-  fail "缺少预警参数文件 /app/ops/header_limits.env"
-fi
-
-# ---------- 4) 防线：质检门禁（干净日志通过；注入 431 拦截；可重复） ----------
-GATE="/app/ops/quality_gate.sh"
-if [ -x "$GATE" ]; then
-  for lg in /var/log/nginx/access.log /var/log/nginx/error.log /var/log/nginx/hdrsize.log; do
-    [ -f "$lg" ] && : > "$lg"
   done
-  nginx -s reopen 2>/dev/null || true
-  curl -s -o /dev/null --max-time 10 -H "X-Verify-Token: $big" "$ENTRY/api/v1/profile"
-  sleep 1
-  if bash "$GATE" >/dev/null 2>&1; then ok "质检门禁：干净日志通过（exit 0）"; else fail "质检门禁：干净日志被误拦截"; fi
-  # 4.2a 独立验证 access.log 来源
-  echo "127.0.0.1 - - [$(date '+%d/%b/%Y:%H:%M:%S +0000')] \"GET /injected HTTP/1.1\" 431 0 \"-\" \"verifier\"" >> /var/log/nginx/access.log
-  if bash "$GATE" >/dev/null 2>&1; then fail "质检门禁：access.log 注入 431 后未拦截"; else ok "质检门禁：access.log 来源拦截生效"; fi
-  : > /var/log/nginx/access.log
-  # 4.2b 独立验证 hdrsize.log + error.log 来源
-  [ -f /var/log/nginx/hdrsize.log ] && echo "$(date +%s).000 431 99999 \"GET /injected HTTP/1.1\"" >> /var/log/nginx/hdrsize.log
-  echo "$(date '+%Y/%m/%d %H:%M:%S') [info] 999#999: *1 client sent too long header line while reading client request headers, client: 127.0.0.1, server: _, request: \"GET /injected HTTP/1.1\"" >> /var/log/nginx/error.log
-  if bash "$GATE" >/dev/null 2>&1; then fail "质检门禁：hdrsize/error 注入 431 后未拦截"; else ok "质检门禁：hdrsize/error 来源拦截生效"; fi
-  [ -f /var/log/nginx/hdrsize.log ] && : > /var/log/nginx/hdrsize.log
-  : > /var/log/nginx/error.log
-  nginx -s reopen 2>/dev/null || true
+  case "$dim" in
+    basic) BASIC_PASS=$pass; BASIC_TOTAL=$total ;;
+    edge)  EDGE_PASS=$pass;  EDGE_TOTAL=$total ;;
+  esac
+  return 0
+}
+run_dim basic
+run_dim edge
+
+# ---------- dimension: quality（综合分析报告硬断言 ①~⑦） ----------
+Q_PASS=0; Q_TOTAL=7
+R="/app/ops/diagnosis_report.md"
+if [ -s "$R" ]; then
+  grep -qE '归因|综合' "$R" && { ok "报告①：归因结论"; Q_PASS=$((Q_PASS+1)); } || fail "报告①：缺归因结论"
+  grep -qE '状态码链|修复前' "$R" && grep -qE '→|->' "$R" \
+    && { ok "报告②：状态码链（修复前→分层修复后）"; Q_PASS=$((Q_PASS+1)); } || fail "报告②：缺状态码链（修复前/修复后链条）"
+  grep -q '8192' "$R" && grep -q "${LIM:-65536}" "$R" \
+    && { ok "报告③：限额数值对照（8192 → 新值）"; Q_PASS=$((Q_PASS+1)); } || fail "报告③：缺限额数值对照（缺 8192 或新限额 $LIM）"
+  grep -qE 'HDRSTAT|max_header|request_length' "$R" \
+    && grep -qE '注入|增长' "$R" && grep -qE '过小|未同步|未扩容' "$R" \
+    && { ok "报告④：实质归因（量化证据+注入侧+限制侧）"; Q_PASS=$((Q_PASS+1)); } || fail "报告④：缺实质归因（量化证据/注入侧/限制侧）"
+  grep -qiE '余量|sizing' "$R" \
+    && { ok "报告⑤：容量取值依据（余量/sizing）"; Q_PASS=$((Q_PASS+1)); } || fail "报告⑤：缺容量取值依据（余量/sizing）"
+  grep -qE 'large_client_header_buffers|MaxHeaderBytes|ReadBufferSize' "$R" \
+    && { ok "报告⑥：所改限制项名称"; Q_PASS=$((Q_PASS+1)); } || fail "报告⑥：未提及所修改的限制项名称"
+  grep -q '10240' "$R" && grep -q '12288' "$R" \
+    && { ok "报告⑦：tracegate/meshd 层限额对照"; Q_PASS=$((Q_PASS+1)); } || fail "报告⑦：缺 tracegate/meshd 层限额数值对照"
 else
-  fail "缺少质检门禁 /app/ops/quality_gate.sh"
+  fail "报告①~⑦：缺少综合分析报告 $R"
 fi
 
-# ---------- 5) 防线：预警观测（近阈值告警 + 小请求不误报） ----------
-if [ -f "$LIMENV" ]; then
-  RATIO=$(sed -n 's/^WARN_RATIO=//p' "$LIMENV" | head -n1 | tr -dc '0-9'); [ -n "$RATIO" ] || RATIO=80
-  # WARN_RATIO 有效范围 [50,90]：超范围则阈值/探针关系无法保证（高比例会截短探针到阈值以下）
-  if [ "$RATIO" -lt 50 ] 2>/dev/null || [ "$RATIO" -gt 90 ] 2>/dev/null; then
-    fail "header_limits.env 的 WARN_RATIO=$RATIO 超出有效范围 [50,90]"
-    RATIO=80
-  fi
-  if [ -n "$LIM" ] && [ "$LIM" -gt 4096 ] 2>/dev/null; then
-    THRESH=$(( LIM * RATIO / 100 ))
-    PROBE2=$(( THRESH + 512 )); CAP=$(( LIM - 1024 )); [ "$PROBE2" -gt "$CAP" ] && PROBE2=$CAP
-    # 清理日志增量后进入静默窗口（观测需容忍截断）
-    [ -f /var/log/nginx/hdrsize.log ] && : > /var/log/nginx/hdrsize.log
-    nginx -s reopen 2>/dev/null || true
-    sleep 2
-    before=$(wc -l < /app/ops/warnings.log 2>/dev/null || echo 0)
-    # 5.1 静默检查：常规请求（远低于阈值）10s 内不得产生告警
-    curl -s -o /dev/null --max-time 10 "$ENTRY/api/v1/profile"
-    sleep 10
-    mid=$(wc -l < /app/ops/warnings.log 2>/dev/null || echo 0)
-    [ "$mid" -eq "$before" ] && ok "预警观测：常规请求无误报" || fail "预警观测：常规请求触发误报"
-    # 5.2 近阈值请求：两次探针（立即 + ~9s 后），30s 内行数必须增加
-    p2=$(head -c $PROBE2 /dev/zero | tr '\0' 'x')
-    curl -s -o /dev/null --max-time 10 -H "X-Verify-Token: $p2" "$ENTRY/api/v1/profile"
-    hit=0
-    for i in $(seq 1 10); do
-      sleep 3
-      after=$(wc -l < /app/ops/warnings.log 2>/dev/null || echo 0)
-      if [ "$after" -gt "$mid" ]; then hit=1; break; fi
-      if [ "$i" = "3" ]; then
-        curl -s -o /dev/null --max-time 10 -H "X-Verify-Token: $p2" "$ENTRY/api/v1/profile"
-      fi
-    done
-    [ "$hit" = "1" ] && ok "预警观测：接近阈值请求已产生告警（${PROBE2}B ≥ ${THRESH}B）" || fail "预警观测：30s 内未产生告警"
-  else
-    fail "header_limits.env 缺少 NGINX_LARGE_HEADER_BUFFER_BYTES（或值 ≤ 4096）"
-  fi
-else
-  fail "缺少预警参数文件 /app/ops/header_limits.env"
-fi
+# ---------- 加权总分（始终覆盖写入，4 位小数） ----------
+frac() { awk "BEGIN{p=$1; t=$2; printf \"%.4f\", (t>0)?p/t:0}"; }
+STRUCTURE=$(frac "$S_PASS" "$S_TOTAL")
+BASIC=$(frac "$BASIC_PASS" "$BASIC_TOTAL")
+EDGE=$(frac "$EDGE_PASS" "$EDGE_TOTAL")
+QUALITY=$(frac "$Q_PASS" "$Q_TOTAL")
+SCORE=$(awk "BEGIN{printf \"%.4f\", 0.2*$STRUCTURE + 0.3*$BASIC + 0.3*$EDGE + 0.2*$QUALITY}")
 
-# ---------- 6) 综合分析报告（结构化要求见题面"产物 schema"；数值对照+实质归因为硬断言） ----------
-RPT="/app/ops/diagnosis_report.md"
-if [ -s "$RPT" ]; then
-  grep -qE '归因|综合' "$RPT" && ok "综合分析报告存在（含归因结论）" || fail "报告缺归因结论"
-  grep -qE 'large_client_header_buffers|MaxHeaderBytes|ReadBufferSize' "$RPT" \
-    && ok "报告含各层限额对照" || fail "报告未覆盖各层限额对照"
-  # 状态码链：须含"修复前"表述且呈现分层链（箭头连接）
-  grep -qE '状态码链|修复前' "$RPT" && grep -qE '→|->' "$RPT" \
-    && ok "报告含状态码链（修复前→分层修复后）" || fail "报告缺状态码链（修复前/修复后链条）"
-  # 数值对照：须同时含原故障值 8192 与生效的新限额数值（LIM=题面声明值）
-  grep -q '8192' "$RPT" && grep -q "${LIM:-65536}" "$RPT" \
-    && ok "报告含限额数值对照（8192 → 新值）" || fail "报告缺限额数值对照（缺 8192 或新限额 $LIM）"
-  # 实质归因：须含量化观测证据 + "谁注入过多"与"哪层限制过小"两类归因表述
-  grep -qE 'HDRSTAT|max_header|request_length' "$RPT" \
-    && grep -qE '注入|增长' "$RPT" && grep -qE '过小|未同步|未扩容' "$RPT" \
-    && ok "报告含实质归因（量化证据+两侧归因）" || fail "报告缺实质归因（量化证据/注入侧/限制侧）"
-  grep -qiE '余量|sizing' "$RPT" \
-    && ok "报告含容量取值依据（增长余量/sizing）" || fail "报告缺容量取值依据（余量/sizing）"
-  # ⑦ 中间层限额对照：报告须覆盖 tracegate/meshd 的原故障值与新值
-  grep -q '10240' "$RPT" && grep -q '12288' "$RPT" \
-    && ok "报告含 tracegate/meshd 层限额对照（10240/12288）" || fail "报告缺 tracegate/meshd 层限额数值对照"
-else
-  fail "缺少综合分析报告 /app/ops/diagnosis_report.md"
-fi
-
-# ---------- 结果 ----------
-echo "$PASS" > "$REWARD_FILE"
-echo "[verifier] reward=$PASS"
+echo "==================================================================="
+echo "[verifier] 结构完整性 structure=$STRUCTURE ($S_PASS/$S_TOTAL)"
+echo "[verifier] 基础修复   basic    =$BASIC ($BASIC_PASS/$BASIC_TOTAL)"
+echo "[verifier] 边界防线   edge     =$EDGE ($EDGE_PASS/$EDGE_TOTAL)"
+echo "[verifier] 报告质量   quality  =$QUALITY ($Q_PASS/$Q_TOTAL)"
+printf '%s\n' "$SCORE" > "$REWARD_FILE"
+echo "[verifier] reward=$SCORE → $REWARD_FILE"
 exit 0
