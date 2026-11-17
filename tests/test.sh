@@ -1,262 +1,185 @@
 #!/bin/bash
 # =============================================================================
-# 431 任务验题脚本（平台 tests/test.sh）—— 加权连续评分 + 双级门槛版（独立判分）
+# 431 任务验题脚本（平台 tests/test.sh）—— 4 面 / 2 阶段 加权部分分（独立判分）
 #
-# 判分环境为 tests/Dockerfile 镜像（environment_mode="separate"）：无 nginx/go/kafka/
-# 服务组件，本脚本与全部子检查**不发实时探针**——行为证据来自交付目录 /app/ops/
-# （task.toml artifacts）及其 evidence/ 六个证据文件（题面"验题契约"逐文件 schema）。
-# 门禁类子检查在判分环境本地伪造 /var/log/nginx 日志后执行交付的 quality_gate.sh。
+# 判分环境为 tests/Dockerfile 镜像（environment_mode="separate"）：无 nginx/go/kafka
+# 服务，不发实时探针——全部判定读取交付目录 /app/ops/（task.toml artifacts）。
 #
-# reward = 0.15×结构完整性 + 0.25×基础修复 + 0.40×边界与防线 + 0.2×综合报告质量
+# reward = 0.15×结构 + 0.30×基础修复 + 0.35×证据齐全 + 0.20×报告质量
 #
-#   structure（结构完整性，3 交付阶段，逐阶段 all-or-nothing）：
-#     阶段1 header_limits.env 存在且格式合法（LIM>4096，RATIO∈[50,90] 或缺失）；
-#     阶段2 quality_gate.sh 可执行；阶段3 diagnosis_report.md 与 evidence/ 六文件齐全。
-#   basic（基础修复，6 子项 = tests/checks/basic/*.sh 通过比例）：
-#     环境在线（组件指纹）/ 端到端探针 / 注入链完整性 / L1 生效（**全部**活动指令取
-#     最小值判定）/ 后端限额声明+行为 / 声明一致性（多条指令须全部与 LIM 相等）；
-#   edge（边界与防线，9 子项 = tests/checks/edge/*.sh 通过比例）：
-#     上边界拒绝 / 门禁（干净 + 三源**各自独立**注入：access / hdrsize / error，每源
-#     另带非 431 内容不得误拦的对照）/ 链路计数（span 精确注入 + kafka 审计证据）/
-#     双侧边界 / 预警内容实质（读交付 warnings.log）；
-#   quality（综合报告质量，8 断言 = diagnosis_report.md 硬断言 ①~⑧ 通过比例）：
-#     关键词之外还要求**同行配对/数值一致性**（状态码链须含真实码值、故障值须与
-#     新值同行对照、报告数值须与 header_limits.env 声明咬合）——纯关键词堆砌不通过。
+#   structure（/5）：repro/F1.sh~F4.sh 四个可执行复现脚本 + diagnosis_report.md 存在
+#     ——模型先交复现即可拿基础分（阶段 1）；
+#   basic（/4，每面修复是否可验证）：
+#     F1 nginx_T 生效单缓冲**全部等于 params.env 的 LIM**（随机参数一致性——硬编码
+#       固定值直接不通过）；F2 端到端大探针 200（经全链路，meshd 限额必须同时打通）；
+#     F3 注入链规格恢复（gate 769 / mesh 1537 / baggage 512 精确）；
+#     F4 broker 限额治理落盘（static > 16384）；
+#   edge（/4，证据齐全度）：evidence/ 下每面至少一个文件；
+#   quality（1）：诊断报告引用了 evidence 下证据文件相对路径。
 #
-# 双级门槛（在加权总分之上生效，见 instruction.md"判定总则"）：
-#   VETO（一票否决 → reward=0）：
-#     ① 报告实质归因缺失——quality 断言①（归因结论）或④（实质归因：量化证据+
-#       注入侧+限制侧）未通过（含报告缺失）；
-#     ② 质检门禁核心行为失败——edge/02（无日志误拦）或 edge/03~05（access/hdrsize/
-#       error 任一分源注入未拦截）不通过（含门禁缺失）。
-#   CAP（交付空心封顶 → reward=min(score, 0.5500)）：
-#     仅当 structure 与 basic 两维度均无任何通过项时触发；edge 单项缺失只扣该
-#     维度分，不额外封顶。
-#
-# 随机化（每轮验题不同，固定样本匹配无效）：门禁注入标记、路径/字节数/时间戳与
-# 两日志书写顺序每轮随机——门禁须按"431 证据"语义实现。
-#
-# 各子检查自身负责本地伪造日志的清理复原，验题可重复执行。
-# reward.txt 总是被写入：脚本启动即落 0.0 兜底（/app/ops 缺失则立即以 0 退出），
-# 结束按计算值覆盖（4 位小数浮点）；判分诊断同步写入 /logs/verifier/debug.txt
-# （交付文件在位情况、各维度得分、VETO/CAP 触发与最终分）。
-# 任一子检查异常退出按失败计，不影响其余子检查与总分落盘。
-# 测试依赖：bash/curl/coreutils/grep/awk/sed —— 见 tests/Dockerfile（判分镜像）。
+# CAP：repro 四脚本全缺 → 总分封顶 0.45（交付空心）。
+# reward.txt 启动即落 0.0000 兜底（/app/ops 缺失立即以 0 退出），结束覆盖写；
+# 诊断写 /logs/verifier/debug.txt。依赖：bash/coreutils/grep/awk/sed（tests/Dockerfile）。
 # =============================================================================
 export LC_ALL=C
 set -u
 
 REWARD_FILE="/logs/verifier/reward.txt"
 DEBUG_FILE="/logs/verifier/debug.txt"
-TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# 注意：不预创建 /app/ops——其存在与否是交付证据，须由 artifacts 收集结果决定
-mkdir -p /logs/verifier /var/log/nginx 2>/dev/null || true
+OPS="/app/ops"
+EV="$OPS/evidence"
+mkdir -p /logs/verifier 2>/dev/null || true
 
 ok()   { echo "[verifier] ok   : $1"; }
 fail() { echo "[verifier] FAIL : $1"; }
-note() { echo "[verifier] note : $1"; }
 
-# 启动即落兜底值：任何提前退出/中途异常（超时/被杀）下 reward.txt 都存在且是有效零分
 printf '%s\n' "0.0000" > "$REWARD_FILE"
 : > "$DEBUG_FILE"
-[ -d /app/ops ] || { echo "ops_dir=missing（空作答：未交付 /app/ops）" >> "$DEBUG_FILE"; exit 0; }
+[ -d "$OPS" ] || { echo "ops_dir=missing（空作答）" >> "$DEBUG_FILE"; exit 0; }
 echo "ops_dir=present" >> "$DEBUG_FILE"
 
-# ---------- dimension: structure（交付物三阶段，逐阶段 all-or-nothing） ----------
-S_PASS=0; S_TOTAL=3
-# 阶段 1：header_limits.env 存在且格式合法（LIM 整数 >4096；RATIO 合法或缺失按 80）
-LIM=""; RATIO=""; S1=0
-if [ -s /app/ops/header_limits.env ]; then
-  LIM=$(sed -n 's/^NGINX_LARGE_HEADER_BUFFER_BYTES=//p' /app/ops/header_limits.env | head -n1 | tr -dc '0-9')
-  RATIO=$(sed -n 's/^WARN_RATIO=//p' /app/ops/header_limits.env | head -n1 | tr -dc '0-9')
-  if [ -n "$LIM" ] && [ "$LIM" -gt 4096 ] 2>/dev/null \
-     && { [ -z "$RATIO" ] || { [ "$RATIO" -ge 50 ] 2>/dev/null && [ "$RATIO" -le 90 ] 2>/dev/null; }; }; then
-    S1=1
+# ---------- params.env（trial 随机容量参数——硬编码扣分的锚定基准） ----------
+LIM=""; RATIO=""
+[ -f "$OPS/params.env" ] && {
+  LIM=$(sed -n 's/^LIM=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')
+  RATIO=$(sed -n 's/^WARN_RATIO=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')
+}
+echo "params: LIM=${LIM:-missing} WARN_RATIO=${RATIO:-missing}" >> "$DEBUG_FILE"
+
+# ---------- 维度 1：结构（/5：4 个 repro 可执行 + 报告存在） ----------
+S_PASS=0; S_TOTAL=5
+for f in F1 F2 F3 F4; do
+  if [ -x "$OPS/repro/${f}.sh" ] && [ -s "$OPS/repro/${f}.sh" ]; then
+    ok "结构 repro/${f}.sh 存在且可执行"; S_PASS=$((S_PASS+1))
+  else
+    fail "结构 repro/${f}.sh 缺失/不可执行/为空（阶段 1：复现脚本）"
   fi
-fi
-[ "$S1" = "1" ] && { ok "结构 阶段1/3：header_limits.env 存在且格式合法（LIM=${LIM}B，RATIO=${RATIO:-缺失按80}）"; S_PASS=$((S_PASS+1)); } \
-  || fail "结构 阶段1/3：header_limits.env 缺失/为空/格式非法（LIM 须整数 >4096；RATIO∈[50,90] 或缺失）"
-# 阶段 2：quality_gate.sh 存在且可执行（模板预置为 644 占位，实现后须 chmod +x）
-[ -x /app/ops/quality_gate.sh ] && { ok "结构 阶段2/3：quality_gate.sh 存在且可执行"; S_PASS=$((S_PASS+1)); } \
-  || fail "结构 阶段2/3：quality_gate.sh 缺失或不可执行"
-# 阶段 3：diagnosis_report.md 与 evidence/ 六文件齐全（任一缺失该阶段 0 分）
-S3=1
-[ -s /app/ops/diagnosis_report.md ] || { fail "结构 阶段3/3：diagnosis_report.md 缺失或为空"; S3=0; }
-for _evf in nginx_T.txt curl_entry.txt curl_backend.txt upper_boundary.txt span_count.txt kafka_audit.txt; do
-  [ -s "/app/ops/evidence/$_evf" ] || { fail "结构 阶段3/3：evidence/$_evf 缺失或为空（运行 bash /app/collect_evidence.sh 采集）"; S3=0; }
 done
-[ "$S3" = "1" ] && { ok "结构 阶段3/3：报告与 evidence/ 六证据齐全"; S_PASS=$((S_PASS+1)); } || true
-
-# ---------- dimension: basic / edge（子检查目录按字典序逐个执行） ----------
-declare -A RC   # 记录各子检查退出码（门槛判定用：RC["basic/03..."]=0/1/3）
-run_dim() {  # $1=checks 子目录名；结果写入 BASIC_PASS/BASIC_TOTAL 或 EDGE_PASS/EDGE_TOTAL
-  local dim="$1" dir="$TESTS_DIR/checks/$1" f base pass=0 total=0 rc=9
-  for f in $(ls "$dir"/*.sh 2>/dev/null | sort); do
-    base=$(basename "$f")
-    echo "----- [$dim/$base] -----"
-    bash "$f"; rc=$?
-    RC["$dim/$base"]=$rc
-    case $rc in
-      0) ok "$dim/$base 通过"; pass=$((pass + 1)); total=$((total + 1)) ;;
-      3) note "$dim/$base 跳过（不计入维度分母）" ;;
-      *) fail "$dim/$base 不通过"; total=$((total + 1)) ;;
-    esac
-  done
-  case "$dim" in
-    basic) BASIC_PASS=$pass; BASIC_TOTAL=$total ;;
-    edge)  EDGE_PASS=$pass;  EDGE_TOTAL=$total ;;
-  esac
-  return 0
-}
-run_dim basic
-run_dim edge
-
-# ---------- dimension: quality（综合分析报告硬断言 ①~⑧，配对/数值一致性口径） ----------
-# 反"关键词堆砌"：②③④⑤⑦⑧ 的证据须落在**同一行**（对照表行/叙述行）且携带真实
-# 码值/字节数——散落全文的孤立关键词不构成对照。
-Q_PASS=0; Q_TOTAL=8; Q_A1=0; Q_A4=0
-R="/app/ops/diagnosis_report.md"
-# pair_line <报告> <故障值>：存在一行——含故障值（词边界），剥离故障值后同行的其余数字
-# （k/M 折算）中有 ≥16402B 且 > 故障值者（16402=16384B 探针完整 header 行下限——新限额
-# 必须放行探针，故配对"新值"不可能低于它；纯关键词或仅邻近小数字不构成对照）。
-pair_line() {
-  awk -v fv="$2" '
-    {
-      line=$0
-      pat="(^|[^0-9])" fv "([^0-9]|$)"
-      if (line !~ pat) next
-      gsub(pat, " ", line)
-      s=line
-      while (match(s, /[0-9]+[kKmM]?/)) {
-        tok=substr(s, RSTART, RLENGTH); v=tok+0
-        if (tok ~ /[kK]$/) v*=1024; else if (tok ~ /[mM]$/) v*=1048576
-        if (v >= 16402 && v > fv) { found=1; exit }
-        s=substr(s, RSTART+RLENGTH)
-      }
-    }
-    END { if (!found) exit 1 }
-  ' "$1"
-}
-if [ -s "$R" ]; then
-  # ① 归因结论：含"归因|综合"，且报告点名 ≥2 个链路组件（nginx/tracegate/meshd/backend）
-  _c=0
-  grep -qi  nginx     "$R" && _c=$((_c+1))
-  grep -qi  tracegate "$R" && _c=$((_c+1))
-  grep -qi  meshd     "$R" && _c=$((_c+1))
-  grep -qiE 'backend|后端' "$R" && _c=$((_c+1))
-  if grep -qE '归因|综合' "$R" && [ "$_c" -ge 2 ]; then
-    ok "报告①：归因结论（含 ${_c} 个链路组件）"; Q_PASS=$((Q_PASS+1)); Q_A1=1
-  else
-    fail "报告①：缺归因结论或未点名链路组件（仅 ${_c} 个，须 ≥2：nginx/tracegate/meshd/backend）"
-  fi
-  # ② 状态码链：含"状态码链|修复前"，且**同一行**呈现真实码值链条（431/400 → … → 200）
-  if grep -qE '状态码链|修复前' "$R" \
-     && awk '/(^|[^0-9])(431|400)([^0-9]|$)/ && /→|->/ && /(^|[^0-9])200([^0-9]|$)/ {found=1} END{exit !found}' "$R"; then
-    ok "报告②：状态码链（同一行含 431/400 → 200 真实码值）"; Q_PASS=$((Q_PASS+1))
-  else
-    fail "报告②：状态码链缺真实码值（须一行内呈现 431/400 → 200 的箭头链条）"
-  fi
-  # ③ 数值对照：报告全文含声明 LIM（词边界，与 header_limits.env 咬合），且**同一行**
-  #   含原故障值 8192 与放行探针级别的更大新值（≥16402B，k/M 折算）
-  if [ -n "$LIM" ] && grep -qE "(^|[^0-9])${LIM}([^0-9]|\$)" "$R" && pair_line "$R" 8192; then
-    ok "报告③：限额数值对照（8192 与 ≥16402B 新值同行；声明 LIM=${LIM} 在报告出现）"; Q_PASS=$((Q_PASS+1))
-  else
-    fail "报告③：缺同行数值对照（8192 → ≥16402B 新值）或报告未含声明 LIM=${LIM:-缺}"
-  fi
-  # ④ 实质归因（VETO 项）：量化证据须**携带数字**（HDRSTAT/max_header/request_length 行
-  #   至少一条含 ≥3 位数字），并具备注入侧与限制侧两类表述
-  if grep -E 'HDRSTAT|max_header|request_length' "$R" | grep -Eq '[0-9]{3,}' \
-     && grep -qE '注入|增长' "$R" && grep -qE '过小|未同步|未扩容' "$R"; then
-    ok "报告④：实质归因（量化证据带数值+注入侧+限制侧）"; Q_PASS=$((Q_PASS+1)); Q_A4=1
-  else
-    fail "报告④：量化证据行无数字，或缺注入侧/限制侧表述（HDRSTAT/max_header/request_length 行须含真实字节数）"
-  fi
-  # ⑤ 容量依据："余量|sizing" 行须携带数字（无数值的 sizing 不构成取值依据）
-  if grep -Ei '余量|sizing' "$R" | grep -Eq '[0-9]'; then
-    ok "报告⑤：容量取值依据（余量/sizing 且带数值）"; Q_PASS=$((Q_PASS+1))
-  else
-    fail "报告⑤：容量依据行无数值（余量/sizing 须配具体字节/百分比）"
-  fi
-  grep -qE 'large_client_header_buffers|MaxHeaderBytes|ReadBufferSize' "$R" \
-    && { ok "报告⑥：所改限制项名称"; Q_PASS=$((Q_PASS+1)); } || fail "报告⑥：未提及所修改的限制项名称"
-  # ⑦ 中间层限额对照：10240 与 12288 各须**同行**伴随放行探针级别的更大新值（≥16402B）
-  if pair_line "$R" 10240 && pair_line "$R" 12288; then
-    ok "报告⑦：tracegate/meshd 层限额同行对照（10240/12288 → ≥16402B 新值）"; Q_PASS=$((Q_PASS+1))
-  else
-    fail "报告⑦：10240/12288 须各自与 ≥16402B 新值同行对照（散落关键词不计）"
-  fi
-  # ⑧ 异步审计旁路三角说明（VETO 联动 ①/④）：16384 与 kafka/MESSAGE_TOO_LARGE **同行**
-  #   呈现（治理对照或信号归因行），跨行孤立关键词不计
-  if grep -E '(^|[^0-9])16384([^0-9]|$)' "$R" | grep -qiE 'MESSAGE_TOO_LARGE|kafka'; then
-    ok "报告⑧：异步审计旁路三角说明（16384 与 kafka/MESSAGE_TOO_LARGE 同行）"; Q_PASS=$((Q_PASS+1))
-  else
-    fail "报告⑧：16384 须与 kafka/MESSAGE_TOO_LARGE 同行呈现（对照 16384→新值 / 信号归因行）"
-  fi
+if [ -s "$OPS/diagnosis_report.md" ]; then
+  ok "结构 diagnosis_report.md 存在"; S_PASS=$((S_PASS+1))
 else
-  fail "报告①~⑦：缺少综合分析报告 $R"
+  fail "结构 diagnosis_report.md 缺失或为空"
 fi
 
-# ---------- 加权总分 + 双级门槛（始终覆盖写入，4 位小数） ----------
-frac() { awk "BEGIN{p=$1; t=$2; printf \"%.4f\", (t>0)?p/t:0}"; }
-STRUCTURE=$(frac "$S_PASS" "$S_TOTAL")
-BASIC=$(frac "$BASIC_PASS" "$BASIC_TOTAL")
-EDGE=$(frac "$EDGE_PASS" "$EDGE_TOTAL")
-QUALITY=$(frac "$Q_PASS" "$Q_TOTAL")
-SCORE=$(awk "BEGIN{printf \"%.4f\", 0.15*$STRUCTURE + 0.25*$BASIC + 0.40*$EDGE + 0.2*$QUALITY}")
+# ---------- 维度 2：基础（/4，每面修复是否可验证） ----------
+B_PASS=0; B_TOTAL=4
+# F1：nginx 生效单缓冲全部 == params LIM（随机参数一致性；多条指令须取值一致）
+NT="$EV/F1_nginx_T.txt"
+if [ -s "$NT" ] && [ -n "$LIM" ]; then
+  MINB=""; MAXB=""; CNT=0
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    b=$(printf '%s' "$v" | awk '{v=$1; if (v ~ /[kK]$/) {sub(/[kK]$/,"",v); print v*1024} else if (v ~ /[mM]$/) {sub(/[mM]$/,"",v); print v*1048576} else print v}')
+    case "$b" in ''|*[!0-9]*) continue ;; esac
+    CNT=$((CNT+1))
+    if [ -z "$MINB" ] || [ "$b" -lt "$MINB" ]; then MINB=$b; fi
+    if [ -z "$MAXB" ] || [ "$b" -gt "$MAXB" ]; then MAXB=$b; fi
+  done < <(grep -E '^[[:space:]]*large_client_header_buffers[[:space:]]' "$NT" 2>/dev/null | sed -E 's/#.*//; s/;.*//' | awk '{print $3}')
+  if [ "$CNT" -ge 1 ] && [ "$MINB" = "$MAXB" ] && [ "$LIM" -eq "$MINB" ] 2>/dev/null; then
+    ok "F1：nginx 生效单缓冲全部 == params LIM（${CNT} 条指令 = ${MINB}B，随机参数一致）"
+    B_PASS=$((B_PASS+1))
+  else
+    fail "F1：nginx 生效单缓冲（${CNT} 条，${MINB:-无}~${MAXB:-无}B）须全部 == params.env LIM=${LIM:-缺}——硬编码固定值不通过"
+  fi
+else
+  fail "F1：evidence/F1_nginx_T.txt 缺失或 params.env LIM 缺失，无法核验生效配置"
+fi
+# F2：端到端大探针 200（经全链路）+ 响应体特征
+F2="$EV/F2_backend_status.txt"
+if [ -s "$F2" ]; then
+  BB=$(sed -n 's/^backend_big_status=//p' "$F2" | head -n1)
+  EB=$(sed -n 's/^entry_big_status=//p' "$F2" | head -n1)
+  PB=$(sed -n 's/^profile_body=//p' "$F2" | head -n1)
+  if [ "$BB" = "200" ] && [ "$EB" = "200" ] && printf '%s' "$PB" | grep -q '"msg":"ok"'; then
+    ok "F2：入口与直连后端大探针均 200，响应体特征正确（全链路打通）"
+    B_PASS=$((B_PASS+1))
+  else
+    fail "F2：backend_big_status=${BB:-缺} / entry_big_status=${EB:-缺} / 响应体异常——全链路（含 mesh 限额）须打通且 200"
+  fi
+else
+  fail "F2：evidence/F2_backend_status.txt 缺失（运行 bash /app/tools/collect_backend.sh）"
+fi
+# F3：注入链规格恢复（gate 769 / mesh 1537 / baggage 512 精确——缩水与虚增均不通过）
+F3="$EV/F3_span_count.txt"
+if [ -s "$F3" ]; then
+  G=$(sed -n 's/^gate_trace_delta=//p' "$F3" | head -n1)
+  M=$(sed -n 's/^mesh_trace_delta=//p' "$F3" | head -n1)
+  BG=$(sed -n 's/^baggage_bytes=//p' "$F3" | head -n1)
+  if [ "$G" = "769" ] && [ "$M" = "1537" ] && [ "$BG" = "512" ]; then
+    ok "F3：注入链规格恢复（gate 769 / mesh 1537 / baggage 512 精确）"
+    B_PASS=$((B_PASS+1))
+  else
+    fail "F3：链路计数失真（gate=${G:-缺}/mesh=${M:-缺}/baggage=${BG:-缺}，须恰 769/1537/512——span 规格未恢复或虚增）"
+  fi
+else
+  fail "F3：evidence/F3_span_count.txt 缺失（运行 bash /app/tools/collect_trace.sh）"
+fi
+# F4：broker 限额治理落盘（static > 16384，防重启回退）
+F4="$EV/F4_kafka_audit.txt"
+if [ -s "$F4" ]; then
+  ST=$(sed -n 's/^kafka_message_max_bytes_static=//p' "$F4" | head -n1 | grep -oE '[0-9]+' | head -n1)
+  if [ -n "$ST" ] && [ "$ST" -gt 16384 ] 2>/dev/null; then
+    ok "F4：broker 静态限额已治理落盘（message.max.bytes=$ST > 16384）"
+    B_PASS=$((B_PASS+1))
+  else
+    fail "F4：kafka_message_max_bytes_static=${ST:-缺}（须 >16384——限额未治理或未落盘 server.properties）"
+  fi
+else
+  fail "F4：evidence/F4_kafka_audit.txt 缺失（运行 bash /app/tools/collect_kafka.sh）"
+fi
 
+# ---------- 维度 3：证据齐全（/4，每面至少一个文件） ----------
+E_PASS=0; E_TOTAL=4
+for f in F1 F2 F3 F4; do
+  if ls "$EV/${f}_"* >/dev/null 2>&1; then
+    ok "证据 ${f}_* 存在"; E_PASS=$((E_PASS+1))
+  else
+    fail "证据 ${f}_* 缺失（evidence/ 下须有该面的采集文件）"
+  fi
+done
+
+# ---------- 维度 4：报告质量（引用证据路径） ----------
+Q_PASS=0; Q_TOTAL=1
+R="$OPS/diagnosis_report.md"
+if [ -s "$R" ] && grep -q 'evidence/F' "$R"; then
+  ok "报告：引用了 evidence 证据路径"; Q_PASS=$((Q_PASS+1))
+else
+  fail "报告：未引用 evidence 下证据文件相对路径（每面三行：根因/证据/前后数值）"
+fi
+
+# ---------- 加权总分 ----------
+SCORE=$(awk "BEGIN{printf \"%.4f\", 0.15*$S_PASS/$S_TOTAL + 0.30*$B_PASS/$B_TOTAL + 0.35*$E_PASS/$E_TOTAL + 0.20*$Q_PASS/$Q_TOTAL}")
 echo "==================================================================="
-echo "[verifier] 结构完整性 structure=$STRUCTURE ($S_PASS/$S_TOTAL)"
-echo "[verifier] 基础修复   basic    =$BASIC ($BASIC_PASS/$BASIC_TOTAL)"
-echo "[verifier] 边界防线   edge     =$EDGE ($EDGE_PASS/$EDGE_TOTAL)"
-echo "[verifier] 报告质量   quality  =$QUALITY ($Q_PASS/$Q_TOTAL)"
+echo "[verifier] 结构 structure=$S_PASS/$S_TOTAL  基础 basic=$B_PASS/$B_TOTAL  证据 edge=$E_PASS/$E_TOTAL  报告 quality=$Q_PASS/$Q_TOTAL"
 
-# ---- VETO（一票否决 → 0）----
-VETO_REASON=""
-if [ "$Q_A1" != "1" ] || [ "$Q_A4" != "1" ]; then
-  VETO_REASON="报告实质归因缺失（quality①/④ 未通过：只会改参数不会归因的解法不构成修复）"
-fi
-GATE_RC2="${RC[edge/02_gate_clean.sh]:-9}"; GATE_RC3="${RC[edge/03_gate_inject_access.sh]:-9}"; GATE_RC4="${RC[edge/04_gate_inject_hdrsize.sh]:-9}"; GATE_RC5="${RC[edge/05_gate_inject_error.sh]:-9}"
-if [ "$GATE_RC2" != "0" ] || [ "$GATE_RC3" != "0" ] || [ "$GATE_RC4" != "0" ] || [ "$GATE_RC5" != "0" ]; then
-  VETO_REASON="${VETO_REASON:+$VETO_REASON；}质检门禁核心行为失败（edge/02~05 任一不通过：干净误拦或 access/hdrsize/error 任一分源 431 未拦截，431 高优先级拦截防线未建立）"
-fi
-if [ -n "$VETO_REASON" ]; then
-  echo "[verifier] VETO 一票否决：$VETO_REASON"
-  SCORE="0.0000"
-else
-  # ---- CAP（交付空心封顶 0.5500）：仅当 structure 与 basic 两维度均无任何通过项时触发；
-  #      edge 单项缺失只扣该维度分，不额外封顶（链路计数失真等按比例扣分）----
-  if [ "$S_PASS" -eq 0 ] && [ "${BASIC_PASS:-0}" -eq 0 ]; then
-    echo "[verifier] CAP 交付空心封顶：structure 与 basic 均无通过项，reward 封顶 0.5500"
-    CAP_NOTE="structure+basic 均为 0 → 封顶 0.5500"
-    SCORE=$(awk "BEGIN{v=$SCORE; printf \"%.4f\", (v>0.55)?0.55:v}")
-  else
-    CAP_NOTE="none"
-  fi
+# ---------- CAP：repro 完全为空 → 封顶 0.45 ----------
+REPRO_COUNT=0
+for f in F1 F2 F3 F4; do
+  [ -x "$OPS/repro/${f}.sh" ] && [ -s "$OPS/repro/${f}.sh" ] && REPRO_COUNT=$((REPRO_COUNT+1))
+done
+CAP_NOTE="none"
+if [ "$REPRO_COUNT" -eq 0 ]; then
+  SCORE=$(awk "BEGIN{printf \"%.4f\", ($SCORE < 0.45 ? $SCORE : 0.45)}")
+  CAP_NOTE="repro 全缺 → 封顶 0.4500"
+  echo "[verifier] CAP：repro 四脚本全缺，reward 封顶 0.4500"
 fi
 
-# ---------- debug.txt（判分诊断：交付文件在位情况 + 各维度得分 + 门槛与最终分） ----------
+# ---------- debug.txt ----------
 {
   echo "=== delivery ==="
   echo "ops_dir=present"
-  for _f in header_limits.env quality_gate.sh diagnosis_report.md warnings.log; do
-    _p="/app/ops/$_f"
-    if [ "$_f" = "quality_gate.sh" ]; then
-      echo "$_f exists=$([ -f "$_p" ] && echo yes || echo no) executable=$([ -x "$_p" ] && echo yes || echo no)"
-    else
-      echo "$_f exists=$([ -s "$_p" ] && echo yes || echo no)"
-    fi
+  for f in F1 F2 F3 F4; do
+    echo "repro/$f.sh exists=$([ -s "$OPS/repro/$f.sh" ] && echo yes || echo no) executable=$([ -x "$OPS/repro/$f.sh" ] && echo yes || echo no)"
   done
-  for _f in nginx_T.txt curl_entry.txt curl_backend.txt upper_boundary.txt span_count.txt kafka_audit.txt; do
-    echo "evidence/$_f exists=$([ -s "/app/ops/evidence/$_f" ] && echo yes || echo no)"
-  done
+  echo "diagnosis_report.md exists=$([ -s "$R" ] && echo yes || echo no)"
+  for f in "$EV"/*; do [ -f "$f" ] && echo "evidence/$(basename "$f") exists=yes"; done
   echo "=== dimensions ==="
-  echo "structure=$STRUCTURE ($S_PASS/$S_TOTAL)"
-  echo "basic=$BASIC ($BASIC_PASS/$BASIC_TOTAL)"
-  echo "edge=$EDGE ($EDGE_PASS/$EDGE_TOTAL)"
-  echo "quality=$QUALITY ($Q_PASS/$Q_TOTAL)"
-  echo "veto=${VETO_REASON:-none}"
-  echo "cap=${CAP_NOTE:-none}"
-  echo "reward=$SCORE"
+  echo "structure=$S_PASS/$S_TOTAL"
+  echo "basic=$B_PASS/$B_TOTAL"
+  echo "edge=$E_PASS/$E_TOTAL"
+  echo "quality=$Q_PASS/$Q_TOTAL"
+  echo "repro_count=$REPRO_COUNT"
+  echo "score=$SCORE"
 } > "$DEBUG_FILE"
 
 printf '%s\n' "$SCORE" > "$REWARD_FILE"

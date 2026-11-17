@@ -54,23 +54,21 @@ RUN rm -f /etc/nginx/sites-enabled/default
 # error log 提到 info 级：header 超限证据（client sent too long header line）可见，供排查定位
 RUN sed -i 's#error_log /var/log/nginx/error.log;#error_log /var/log/nginx/error.log info;#' /etc/nginx/nginx.conf
 
-# 独立判分交付 scaffolding：预创建交付目录（含 evidence/），预置四产物空模板
-# （header_limits.env / quality_gate.sh(644 不可执行) / diagnosis_report.md / README.md，
-# 内容为注释示例，不计分），并内置证据采集脚本 /app/collect_evidence.sh（题面 README 说明用法）
-RUN mkdir -p /app/ops/evidence
+# 独立判分交付 scaffolding：交付目录（repro/fix/evidence 三阶段）+ 四产物空模板
+# （内容为注释示例，不计分）+ 四面原始数据采集脚本（tools/，只采集不做断言）
+RUN mkdir -p /app/ops/repro /app/ops/fix /app/ops/evidence
 COPY ops-template/. /app/ops/
-RUN chmod 0644 /app/ops/header_limits.env /app/ops/quality_gate.sh \
-               /app/ops/diagnosis_report.md /app/ops/README.md \
-    && chmod 0755 /app/ops/evidence
-COPY collect_evidence.sh /app/collect_evidence.sh
-RUN chmod 0755 /app/collect_evidence.sh
+RUN chmod 0644 /app/ops/diagnosis_report.md /app/ops/README.md \
+    && chmod 0755 /app/ops/repro /app/ops/fix /app/ops/evidence
+COPY tools/ /app/tools/
+RUN chmod 0755 /app/tools/*.sh
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod 0755 /app/entrypoint.sh
 
-# 服务编排：容器主进程 = supervisord（前台驻留 + autorestart 守护），
-# 不使用自制启动脚本（避免非终止脚本/常驻进程扫描风险）
+# 服务编排：容器主进程 = entrypoint（生成随机容量参数 params.env 后移交 supervisord，
+# 前台驻留 + autorestart 守护）；追加参数由 entrypoint 忽略（Harbor keepalive 兼容）
 COPY supervisor-app.conf /etc/supervisor/conf.d/app.conf
 
 WORKDIR /app
 EXPOSE 80
-# Harbor 的 compose 运行时会向 ENTRYPOINT 追加 keepalive command；
-# supervisord 不接受位置参数（追加即 exit 2），故用 bash -c 固定脚本形态忽略追加参数。
-ENTRYPOINT ["/bin/bash", "-c", "exec /usr/bin/supervisord -n -c /etc/supervisor/supervisord.conf"]
+ENTRYPOINT ["/app/entrypoint.sh"]
