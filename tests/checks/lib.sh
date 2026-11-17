@@ -53,15 +53,22 @@ load_lim() {
   return 0
 }
 
-# nginx_buf_from_file <nginx_T.txt>：解析 large_client_header_buffers 的单缓冲字节数
-# （k/M 后缀折算；仅认未注释的活动指令）。结果存 NG_BUF / NG_BUF_B，找到返回 0。
+# nginx_buf_from_file <nginx_T.txt>：解析 large_client_header_buffers 的**全部**未注释
+# 活动指令（非仅首条——残留的过小/不一致指令同样构成隐患），逐条 k/M 折算单缓冲字节。
+# 结果：NG_BUF_COUNT（指令条数）、NG_BUF_MIN_RAW/NG_BUF_MIN_B（最小单缓冲原始写法/字节）、
+# NG_BUF_MAX_B（最大单缓冲字节）；至少一条找到返回 0，否则 1。
 nginx_buf_from_file() {
-  local f="$1" v
-  v=$(grep -E '^[[:space:]]*large_client_header_buffers[[:space:]]' "$f" 2>/dev/null | head -n1 | awk '{gsub(/;/,""); print $3}')
-  if [ -z "$v" ]; then NG_BUF=""; NG_BUF_B=""; return 1; fi
-  NG_BUF="$v"
-  NG_BUF_B=$(printf '%s' "$v" | awk '{v=$1; if (v ~ /[kK]$/) {sub(/[kK]$/,"",v); print v*1024} else if (v ~ /[mM]$/) {sub(/[mM]$/,"",v); print v*1048576} else print v}')
-  return 0
+  local f="$1" v b
+  NG_BUF_COUNT=0; NG_BUF_MIN_B=""; NG_BUF_MAX_B=""; NG_BUF_MIN_RAW=""
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    b=$(printf '%s' "$v" | awk '{v=$1; if (v ~ /[kK]$/) {sub(/[kK]$/,"",v); print v*1024} else if (v ~ /[mM]$/) {sub(/[mM]$/,"",v); print v*1048576} else print v}')
+    case "$b" in ''|*[!0-9]*) continue ;; esac
+    NG_BUF_COUNT=$((NG_BUF_COUNT + 1))
+    if [ -z "$NG_BUF_MIN_B" ] || [ "$b" -lt "$NG_BUF_MIN_B" ]; then NG_BUF_MIN_B=$b; NG_BUF_MIN_RAW=$v; fi
+    if [ -z "$NG_BUF_MAX_B" ] || [ "$b" -gt "$NG_BUF_MAX_B" ]; then NG_BUF_MAX_B=$b; fi
+  done < <(grep -E '^[[:space:]]*large_client_header_buffers[[:space:]]' "$f" 2>/dev/null | sed -E 's/#.*//; s/;.*//' | awk '{print $3}')
+  [ "$NG_BUF_COUNT" -gt 0 ] 2>/dev/null
 }
 
 # run_gate <日志伪造子检查用>：在判分环境执行交付的门禁脚本（可执行性由调用方先判定）

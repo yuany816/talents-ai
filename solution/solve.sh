@@ -911,13 +911,24 @@ else
   warn "预警观测: 暂未捕获预警（检查 /var/log/backend.log 中 HDRSTAT 与中间件注入状态）"
 fi
 
-# ---------- 步骤⑨.6：独立判分证据落盘（/app/ops/evidence/，artifacts = /app/ops/） ----------
-# Harbor 以 environment_mode="separate" 独立判分：判分环境无服务、不发实时探针，
-# 全部行为证据由本步骤在作答环境采集并按题面"验题契约"的逐文件 schema 落盘
-# （六文件与 tests/checks/* 的断言一一对应）。幂等：每轮覆盖重写。
-say "步骤⑨.6：判分证据落盘（$OPS_DIR/evidence/）"
+# ---------- 步骤⑨.6：独立判分证据落盘（/app/ops/evidence/） ----------
+# Harbor 以 environment_mode="separate" 独立判分：判分环境无服务、不发实时探针。
+# 证据采集优先使用环境内置的 /app/collect_evidence.sh（与题面 README 同一脚本，
+# 单一事实来源）；脚本缺失/失败时降级为下方内置采集（口径一致，勿单侧修改）。
+say "步骤⑨.6：判分证据落盘（$OPS_DIR/evidence/，经 /app/collect_evidence.sh）"
 EV="$OPS_DIR/evidence"
 mkdir -p "$EV"
+CE_OK=0
+if [ -x /app/collect_evidence.sh ]; then
+  if /app/collect_evidence.sh; then
+    CE_OK=1
+    say "证据已由环境内置采集脚本生成"
+  else
+    warn "采集脚本返回非零，降级为内置采集"
+  fi
+fi
+if [ "$CE_OK" = "0" ]; then
+  [ -x /app/collect_evidence.sh ] || warn "缺少 /app/collect_evidence.sh，降级为内置采集"
 EV_ENTRY="${SCHEME}://127.0.0.1:${PORT}"
 EV_BE="http://127.0.0.1:9000"
 # 大探针经临时 header 文件投递（curl -H @file，7.55+）：规避内核单参数 128KB 上限，
@@ -1016,6 +1027,7 @@ kafka_message_max_bytes_static=${EV_KAF_STATIC:-0}
 audit_event_marker=${EV_MARK}
 audit_event_recorded=${EV_AUDIT}
 EOF
+fi
 say "证据落盘: $(ls "$EV" | tr '\n' ' ')"
 
 

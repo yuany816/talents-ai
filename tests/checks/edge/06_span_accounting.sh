@@ -1,5 +1,5 @@
 #!/bin/bash
-# edge/07 —— 链路计数①（CAP 触发项，证据断言）：链路注入量规格（gate span 768B /
+# edge/06 —— 链路计数①（CAP 触发项，证据断言）：链路注入量规格（gate span 768B /
 # mesh span 1536B / X-Mesh-Baggage 512B）是容量探针数学的前提——缩水与凭空增大都判不通过。
 # evidence/span_count.txt 记录逐层精确计数与 nonce 回显：
 #   gate_trace_delta==769（768+分隔符）、mesh_trace_delta==1537、baggage_bytes==512；

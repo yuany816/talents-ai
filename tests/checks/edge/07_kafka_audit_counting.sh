@@ -1,5 +1,5 @@
 #!/bin/bash
-# edge/08 —— 链路计数②（CAP 触发项，证据断言）：kafka 异步审计链路治理——
+# edge/07 —— 链路计数②（CAP 触发项，证据断言）：kafka 异步审计链路治理——
 #   - kafka_message_max_bytes_static：/opt/kafka/config/kraft/server.properties 落盘值
 #     不得残留原故障值 16384（动态 alter 不落盘 = 重启回退风险），且须 > 16384；
 #   - audit_event_recorded=ok + audit_event_marker：作答环境以一次性标记大探针自证

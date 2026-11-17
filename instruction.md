@@ -72,8 +72,12 @@ span 上下文）。上线后客服陆续收到反馈：部分接口"随机"失�
      `curl_backend.txt`（直连后端探针）、`upper_boundary.txt`（双侧边界探针记录）、
      `span_count.txt`（一次性 nonce 注入链回显 + GATESTAT/MESHSTAT 逐层精确计数）、
      `kafka_audit.txt`（kafka 探活/组件指纹/限额落盘值/审计事件标记自证）——
-     逐文件 schema 与判定口径见"验题契约"；证据须来自作答环境的真实探针
-     （参考实现见 solution/solve.sh 步骤⑨.6），相互矛盾的记录按失败计。
+     **环境已内置采集脚本 `/app/collect_evidence.sh`：运行它自动生成六文件，
+     然后核对输出取值与实际配置一致、按需手工修正**（观测路径不同的部分）；
+     逐文件 schema 与判定口径见"验题契约"，相互矛盾的记录按失败计；
+   - `/app/ops/` 各交付物均已预置空模板（含注释示例，不计分）：填实
+     `header_limits.env`、实现并 `chmod +x` `quality_gate.sh`、按契约填写
+     `diagnosis_report.md`；`/app/ops/README.md` 有完整交付说明。
 
 ## 验题契约（tests/test.sh 的精确行为，agent 可据此还原判定）
 
@@ -85,27 +89,33 @@ evidence/ 六个证据文件。验题为**加权连续评分 + 双级门槛**，
 0.25×基础修复 + 0.40×边界与防线 + 0.2×报告质量`。各维度按其子检查的**通过比例**
 取 0~1（子检查与各节对应关系见下）；下文各节所述"不通过"即指该子检查不通过，其中
 行为类证据失败通常意味着对应修复未真实生效，连锁拉低多个维度。子检查归属：
-**结构完整性**（5 项）= /app/ops 四产物齐备与限额声明格式（期望结果 5 的产物 schema）；
+**结构完整性**（3 交付阶段，逐阶段 all-or-nothing）= 阶段1 `/app/ops/header_limits.env`
+存在且格式合法（LIM 整数 >4096，RATIO∈[50,90] 或缺失按 80）→ 阶段2
+`quality_gate.sh` 可执行 → 阶段3 `diagnosis_report.md` 与 evidence/ 六文件齐全；
 **基础修复**（6 项）= 0) 组件在线、1) 端到端与注入链完整性、L1 生效、L2 后端限额
-声明+行为、声明一致性（全部读证据文件）；**边界与防线**（8 项）= 3) 上边界拒绝与
-双侧夹逼、4) 质检门禁（判分环境本地伪造日志执行你的脚本）、链路计数（span 精确注入、
-kafka 审计证据）、预警内容实质；**报告质量**（8 项）= 6) 综合分析报告硬断言 ①~⑧。
+声明+行为、声明一致性（全部读证据文件）；**边界与防线**（9 项）= 3) 上边界拒绝与
+双侧夹逼、4) 质检门禁（判分环境本地伪造日志执行你的脚本：干净通过 + access/hdrsize/
+error **三源各自独立**注入，每源另带非 431 内容不得误拦的对照）、链路计数（span 精确
+注入、kafka 审计证据）、预警内容实质；**报告质量**（8 项）= 6) 综合分析报告硬断言
+①~⑧（关键词之外还要求**同行配对/数值一致性**，纯关键词堆砌不通过）。
 
-**双级门槛**（在加权总分之上生效，"改对一半"式解法的分数天花板）：
+**双级门槛**（在加权总分之上生效）：
 - **VETO（一票否决 → reward=0）**：① 报告实质归因缺失——断言①（归因结论）或
   ④（实质归因：量化证据 + 注入侧 + 限制侧）未通过（含报告缺失）；
   ② 质检门禁核心行为失败——无日志误拦或任一分源注入未拦截（含门禁缺失）；
-- **CAP（链路完整性封顶 → reward=min(总分, 0.55)）**：注入链完整性（basic/03）、
-  span 精确注入计数（edge/07）、kafka 审计证据（edge/08）三者**任一**不通过——
-  漏掉 span 规格恢复 / kafka 治理 / 绕过中间层的解法封顶 0.55。
+- **CAP（交付空心封顶 → reward=min(总分, 0.55)）**：仅当 structure 与 basic 两维度
+  **均无任何通过项**时触发；边界与防线（edge）的单项缺失只扣该维度分，不额外封顶。
 
-evidence/ 由你在作答环境按 schema **真实采集**（参考实现：solution/solve.sh 步骤
-⑨.6；探针值/标记/时间戳即为你运行时的实际观测）。各记录**互相咬合**：如
-span_count.txt 的回显增幅必须恰等于逐层计数之和（2306B），upper_boundary.txt 的
-declared_lim 必须与 header_limits.env 的 LIM 相等——相互矛盾、偏离规格或凭空书写的
-记录按该子检查失败计（CAP 触发项的失真同时触发封顶）。验题脚本**可重复执行**
-（判分环境本地伪造日志的注入均会清理复原）。门禁注入含**随机化**：标记、路径、
-字节数与两日志书写顺序每轮不同——门禁须按"431 证据"语义实现而非匹配固定行。
+evidence/ 由环境内置的 `/app/collect_evidence.sh` **自动采集**：运行它，脚本按作答
+环境实际状态探测（nginx -T、入口/直连后端探针、双侧边界探针、一次性 nonce 注入链、
+GATESTAT/MESHSTAT 逐层计数、kafka 探活/组件指纹/审计标记）并生成六文件；运行后
+**核对输出取值与实际配置一致**，观测路径不同的部分手工修正。判分环境亦有同目录
+模板与 `/app/ops/README.md` 说明。各记录**互相咬合**：如 span_count.txt 的回显增幅
+必须恰等于逐层计数之和（2306B），upper_boundary.txt 的 declared_lim 必须与
+header_limits.env 的 LIM 相等——相互矛盾、偏离规格或凭空书写的记录按该子检查
+失败计。验题脚本**可重复执行**（判分环境本地伪造日志的注入均会清理复原）。
+门禁注入含**随机化**：标记、路径、字节数与两日志书写顺序每轮不同——门禁须按
+"431 证据"语义实现而非匹配固定行。
 
 **固定参数及其题面依据**：
 
@@ -113,7 +123,7 @@ declared_lim 必须与 header_limits.env 的 LIM 相等——相互矛盾、偏�
 |---|---|
 | 探针 16384 字节 | 题面复现场景；高于旧 nginx 默认单行上限 8k 与后端旧故障值 8192。**完整 header 行 ≈16402B**（字段名 14B + ": " + 16384B + CRLF） |
 | L1 要求 ≥17408B（17KiB） | 完整 header 行口径：16384B 值 + 行开销约 18B + 1KiB 余量——恰好 16384 的缓冲会误拒合规探针 |
-| LIM 须 == nginx 生效单缓冲 | 边界与预警判定需与实际限额同一数值基准 |
+| LIM 须 == nginx 生效单缓冲 | 边界与预警判定需与实际限额同一数值基准；多条未注释指令须全部与 LIM 相等（取值不一致=配置漂移） |
 | L2 判定口径 | 判分环境无 /app/backend，源码字面扫描不再由判分环境执行——以 header_limits.env 的 `APP_MAX_HEADER_BYTES`（须 >8192）+ `backend_big_status=200` 行为证据双口径判定（作答环境仍须真实移除原故障值及其等值书写形态） |
 | 中间层判定口径 | tracegate/meshd 限额行为由注入链证据（span_count.txt 逐层计数 + 回显增幅）与组件指纹交叉印证——原故障值 `10240` / `12288` 对应的"调大"必须真实生效；运行时生效值可能受部署编排环境覆盖，以组件日志实际计数为准 |
 | 组件探针/指纹（证据记录） | kafka_audit.txt：`kafka_tcp=ok`；tracegate(:9100)/meshd(:15001) 的 `/componentz` 响应记录须含各自组件名（占位桩/移除组件无法自洽）——组件为环境组成部分 |
@@ -145,33 +155,42 @@ declared_lim 必须与 header_limits.env 的 LIM 相等——相互矛盾、偏�
   ≥2048B——绕过/拆除中间层或以静态头伪造注入段的记录无法满足有序段与增幅。
 
 **2) 真实修改（basic/04~06，读 nginx_T.txt 与 header_limits.env）**：
-- L1：`nginx_T.txt`（nginx -T 完整输出）中**未注释**的 `large_client_header_buffers`
-  单缓冲 ≥ 17408（完整 header 行口径，`k`/`M` 后缀折算）；
+- L1：`nginx_T.txt`（nginx -T 完整输出）中**全部**未注释的 `large_client_header_buffers`
+  活动指令单缓冲 ≥ 17408（完整 header 行口径，`k`/`M` 后缀折算）——逐条取**最小值**
+  判定：残留的过小指令（http/server/location 任一层）按 nginx 继承语义在对应作用域
+  真实生效，仅验首条不构成判定；
 - L2 后端：`APP_MAX_HEADER_BYTES` > 8192（声明）且 `backend_big_status=200`（行为）
   双证据——判分环境无 /app/backend，源码字面扫描不再由判分环境执行（作答环境仍须
   真实移除原故障值及其等值书写形态，含退役入口存档；备份后缀文件不计）；
 - **声明一致性**：`NGINX_LARGE_HEADER_BUFFER_BYTES` 折算后必须与 nginx_T.txt 生效
-  单缓冲**相等**，否则不通过。
+  单缓冲**相等**；存在多条未注释指令时各条须**全部与 LIM 相等**（同一限额键多处
+  取值不一致属配置漂移，无法确定入口实际生效值，按不通过处理）。
 
-**3) 边界与输入覆盖（edge/01、edge/09，读 upper_boundary.txt）**：
+**3) 边界与输入覆盖（edge/01、edge/08，读 upper_boundary.txt）**：
 - **上边界**：`above_probe_bytes` > `declared_lim` 且 `above_status` ∉ {200, 空}
   （必须**仍被拒绝**；400/413/431 均算拒绝）；`declared_lim` 须与 header_limits.env
   的 LIM 相等；LIM 缺失或 >1MB 时跳过该项（不计入分母）；
 - **双侧夹逼**：`below_probe_bytes` ∈ [16384, LIM) 且 `below_status` = 200（下侧不得
   卡线误拒）；上侧同上。
 
-**4) 质检门禁（edge/02~04，判分环境本地执行你的 /app/ops/quality_gate.sh）**：
-- **干净**：判分环境无任何 /var/log/nginx 日志 → 门禁必须 **exit 0**（跳过全部缺失
-  来源，不得误拦或崩溃）；
-- **分源注入①**：本地伪造 access.log，追加一条 combined 格式的随机 431 记录
-  （路径/字节数/时间戳/UA 每轮随机）→ 门禁必须 **exit ≠ 0**；
-- **分源注入②**：再向 hdrsize.log 追加一行 `<msec> 431 <随机长度> "GET <随机路径> HTTP/1.1"`、
-  向 error.log 追加一行含 `client sent too long header line` 的 info 级记录（两日志
-  写入顺序每轮洗牌）→ 门禁必须 **exit ≠ 0**；每轮注入后验题会清理复原；
+**4) 质检门禁（edge/02~05，判分环境本地执行你的 /app/ops/quality_gate.sh）**：
+- **干净**（edge/02）：判分环境无任何 /var/log/nginx 日志 → 门禁必须 **exit 0**
+  （跳过全部缺失来源，不得误拦或崩溃）；
+- **分源注入① access**（edge/03）：仅伪造 access.log 并追加一条 combined 格式的随机
+  431 记录（路径/字节数/时间戳/UA 每轮随机）→ 门禁必须 **exit ≠ 0**；
+- **分源注入② hdrsize**（edge/04）：仅伪造 hdrsize.log 并追加一行
+  `<msec> 431 <随机长度> "GET <随机路径> HTTP/1.1"`（error.log 完全不存在，同时复验
+  缺文件容忍）→ 门禁必须 **exit ≠ 0**；
+- **分源注入③ error**（edge/05）：仅伪造 error.log 并追加一行含
+  `client sent too long header line` 的 info 级记录（hdrsize.log 完全不存在）→
+  门禁必须 **exit ≠ 0**；
+- **非 431 对照**：每源注入判定后，仅追加该源的**非 431** 内容（access/hdrsize 的
+  200 记录、error 的无关 info 行）→ 门禁必须 **exit 0**——按"431 证据"语义逐源
+  判定，非 431 内容不得误拦；每轮注入后验题会清理复原；
 - 门禁脚本在判分镜像内以 bash 执行（bash/curl/coreutils/grep/awk/sed 可用，无 nginx/go），
   不得依赖环境内服务或 /var/log 之外的现场状态。
 
-**5) 预警内容实质（edge/10，读交付 warnings.log）**：
+**5) 预警内容实质（edge/09，读交付 warnings.log）**：
 - 读取 header_limits.env：`NGINX_LARGE_HEADER_BUFFER_BYTES` 缺失（或 ≤4096）→ 不通过；
   `WARN_RATIO` 缺失按 80，**声明值超出 [50,90] → 不通过**（结构维度）；
 - warnings.log 非空，且至少一条告警行含 ≥ `THRESH = LIM×RATIO/100` 的整数观测值
@@ -180,23 +199,35 @@ declared_lim 必须与 header_limits.env 的 LIM 相等——相互矛盾、偏�
   不得误报、达到阈值 30s 内可观测"仍是实现契约，以你的 warnings.log 记录为判定对象。）
 
 **6) 综合分析报告**：/app/ops/diagnosis_report.md 非空；按以下硬断言校验——
-① 归因结论：含"归因"或"综合"；
-② 状态码链：含"状态码链"或"修复前"，且以箭头（→）呈现分层链条；
-③ 数值对照：同时含原故障值 `8192` 与生效的新限额数值（即题面声明的 `NGINX_LARGE_HEADER_BUFFER_BYTES`）；
-④ 实质归因：含量化观测证据（`HDRSTAT` / `max_header` / `request_length` 至少其一），
-   且同时具备"谁注入过多"（含"注入"或"增长"）与"哪层限制过小"（含"过小"/"未同步"/"未扩容"）两类表述；
-⑤ 容量依据：含"余量"或"sizing"；
+关键词之外还要求**同行配对/数值一致性**（对照须落在同一行/同一表行，散落全文的孤立
+关键词不构成对照，防"关键词堆砌"式报告）：
+① 归因结论：含"归因"或"综合"，且报告点名 ≥2 个链路组件（nginx / tracegate / meshd /
+   backend 至少其二——链路级归因须落到具体模块）；
+② 状态码链：含"状态码链"或"修复前"，且**同一行**以箭头（→）呈现真实码值链条
+   （431/400 → … → 200）；
+③ 数值对照：**同一行**含原故障值 `8192` 与更大的新值（≥16402B——16384B 探针完整行下限，k/M 折算），
+   且报告全文含题面声明的 `NGINX_LARGE_HEADER_BUFFER_BYTES` 数值（与 header_limits.env
+   咬合）；
+④ 实质归因（触发 VETO）：量化观测证据行（`HDRSTAT` / `max_header` / `request_length`
+   至少其一）须**携带真实字节数**（≥3 位数字），且同时具备"谁注入过多"（含"注入"或
+   "增长"）与"哪层限制过小"（含"过小"/"未同步"/"未扩容"）两类表述；
+⑤ 容量依据：含"余量"或"sizing"的行须**携带数值**（字节/百分比）；
 ⑥ 提及所修改的限制项名称（`large_client_header_buffers` / `MaxHeaderBytes` / `ReadBufferSize` 至少其一）；
-⑦ 中间层限额对照：同时含 tracegate 原故障值 `10240` 与 meshd 原故障值 `12288` 的数值对照；
-⑧ 异步审计旁路三角说明：含原 broker 限额 `16384`，且提及 kafka / MESSAGE_TOO_LARGE
-   容量信号与同步 431 的区分（断言①/④任一未通过触发 VETO）。
+⑦ 中间层限额对照：tracegate 原故障值 `10240` 与 meshd 原故障值 `12288` 各自**同行**
+   伴随更大的新值（≥16402B——16384B 探针完整行下限，k/M 折算
+   通过后必然 ≥17408）；
+⑧ 异步审计旁路三角说明：**同一行**含原 broker 限额 `16384` 与 kafka / MESSAGE_TOO_LARGE
+   （治理对照 16384→新值 或 容量信号归因行），并区分于同步 431（断言①/④任一未通过
+   触发 VETO）。
 
-**产物 schema（结构化输出契约，判分环境按此读取；task.toml artifacts = ["/app/ops/"]）**：
+**产物 schema（结构化输出契约，判分环境按此读取；task.toml artifacts =
+["/app/ops/header_limits.env", "/app/ops/"]——主交付物为 header_limits.env 单文件
+（对应 structure 阶段1），其余产物与 evidence/ 随目录一并收集作为加分项）**：
 - `/app/ops/header_limits.env`：KEY=VALUE 行；**必含** `NGINX_LARGE_HEADER_BUFFER_BYTES`
   （整数，字节，等于 nginx 生效单缓冲）、`WARN_RATIO`（整数，百分比，缺失按 80）与
   `APP_MAX_HEADER_BYTES`（整数，字节，>8192，后端侧生效限额——basic/05 的声明证据）；
   其余键（如框架层限额、原始值）可选；
-- `/app/ops/warnings.log`：每行一条告警（建议含时间与触发的请求大小）；edge/10 校验
+- `/app/ops/warnings.log`：每行一条告警（建议含时间与触发的请求大小）；edge/09 校验
   **至少一条行含 ≥ 阈值的整数观测值**（空文本/小数值伪造行不通过）；
 - `/app/ops/quality_gate.sh`：可执行（判分环境以 bash 本地执行，见契约 4）；
 - `/app/ops/diagnosis_report.md`：Markdown；必含 ①各层状态码链（修复前/分层修复后）

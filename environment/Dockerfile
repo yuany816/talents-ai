@@ -54,6 +54,17 @@ RUN rm -f /etc/nginx/sites-enabled/default
 # error log 提到 info 级：header 超限证据（client sent too long header line）可见，供排查定位
 RUN sed -i 's#error_log /var/log/nginx/error.log;#error_log /var/log/nginx/error.log info;#' /etc/nginx/nginx.conf
 
+# 独立判分交付 scaffolding：预创建交付目录（含 evidence/），预置四产物空模板
+# （header_limits.env / quality_gate.sh(644 不可执行) / diagnosis_report.md / README.md，
+# 内容为注释示例，不计分），并内置证据采集脚本 /app/collect_evidence.sh（题面 README 说明用法）
+RUN mkdir -p /app/ops/evidence
+COPY ops-template/. /app/ops/
+RUN chmod 0644 /app/ops/header_limits.env /app/ops/quality_gate.sh \
+               /app/ops/diagnosis_report.md /app/ops/README.md \
+    && chmod 0755 /app/ops/evidence
+COPY collect_evidence.sh /app/collect_evidence.sh
+RUN chmod 0755 /app/collect_evidence.sh
+
 # 服务编排：容器主进程 = supervisord（前台驻留 + autorestart 守护），
 # 不使用自制启动脚本（避免非终止脚本/常驻进程扫描风险）
 COPY supervisor-app.conf /etc/supervisor/conf.d/app.conf
