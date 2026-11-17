@@ -27,8 +27,8 @@ echo "ops_dir=present" >> "$DEBUG_FILE"
 # ---------- params.env ----------
 LIM=""; RATIO=""
 [ -f "$OPS/params.env" ] && {
-  LIM=$(sed -n 's/^LIM=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')
-  RATIO=$(sed -n 's/^WARN_RATIO=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')
+  LIM=$(sed -n 's/^[[:space:]]*LIM=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')
+  RATIO=$(sed -n 's/^[[:space:]]*WARN_RATIO=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')
 }
 THRESH=0
 [ -n "$LIM" ] && [ -n "$RATIO" ] && THRESH=$(( LIM * RATIO / 100 ))
@@ -110,9 +110,9 @@ else
 fi
 F2="$EV/F2_backend_status.txt"
 if [ -s "$F2" ]; then
-  BB=$(sed -n 's/^backend_big_status=//p' "$F2" | head -n1)
-  EB=$(sed -n 's/^entry_big_status=//p' "$F2" | head -n1)
-  PB=$(sed -n 's/^profile_body=//p' "$F2" | head -n1)
+  BB=$(sed -n 's/^[[:space:]]*backend_big_status=//p' "$F2" | head -n1)
+  EB=$(sed -n 's/^[[:space:]]*entry_big_status=//p' "$F2" | head -n1)
+  PB=$(sed -n 's/^[[:space:]]*profile_body=//p' "$F2" | head -n1)
   if [ "$BB" = "200" ] && [ "$EB" = "200" ] && printf '%s' "$PB" | grep -q '"msg":"ok"'; then
     ok "F2a：入口与直连后端大探针 200 + 响应体特征"; B_PASS=$((B_PASS+1))
   else
@@ -123,17 +123,17 @@ else
 fi
 F2R="$EV/F2_restart.txt"
 if [ -s "$F2R" ] \
-   && grep -qE '^post_restart_entry_big_status=200' "$F2R" \
-   && grep -qE '^post_restart_backend_big_status=200' "$F2R"; then
+   && grep -qE '^[[:space:]]*post_restart_entry_big_status=200' "$F2R" \
+   && grep -qE '^[[:space:]]*post_restart_backend_big_status=200' "$F2R"; then
   ok "F2b：restart all 后全链路仍 200"; B_PASS=$((B_PASS+1))
 else
   fail "F2b：evidence/F2_restart.txt 缺 post_restart_*_status=200"
 fi
 F2C="$EV/F2_calibration.txt"
 if [ -s "$F2C" ] && [ "$THRESH" -gt 0 ] 2>/dev/null; then
-  BD=$(sed -n 's/^below_warnings_delta=//p' "$F2C" | head -n1 | tr -dc '0-9')
-  AD=$(sed -n 's/^above_warnings_delta=//p' "$F2C" | head -n1 | tr -dc '0-9')
-  AM=$(sed -n 's/^above_max_observed=//p' "$F2C" | head -n1 | tr -dc '0-9')
+  BD=$(sed -n 's/^[[:space:]]*below_warnings_delta=//p' "$F2C" | head -n1 | tr -dc '0-9')
+  AD=$(sed -n 's/^[[:space:]]*above_warnings_delta=//p' "$F2C" | head -n1 | tr -dc '0-9')
+  AM=$(sed -n 's/^[[:space:]]*above_max_observed=//p' "$F2C" | head -n1 | tr -dc '0-9')
   if [ "$BD" = "0" ] && [ -n "$AD" ] && [ "$AD" -ge 1 ] 2>/dev/null \
      && [ -n "$AM" ] && [ "$AM" -ge "$THRESH" ] 2>/dev/null; then
     ok "F2c：预警双侧标定成立（below 0 / above ${AD} / 观测 ${AM} ≥ THRESH ${THRESH}）"
@@ -146,11 +146,11 @@ else
 fi
 F3="$EV/F3_span_count.txt"
 if [ -s "$F3" ]; then
-  G=$(sed -n 's/^gate_trace_delta=//p' "$F3" | head -n1)
-  M=$(sed -n 's/^mesh_trace_delta=//p' "$F3" | head -n1)
-  BG=$(sed -n 's/^baggage_bytes=//p' "$F3" | head -n1)
-  NC=$(sed -n 's/^nonce=//p' "$F3" | head -n1)
-  EC=$(sed -n 's/^echo=//p' "$F3" | head -n1)
+  G=$(sed -n 's/^[[:space:]]*gate_trace_delta=//p' "$F3" | head -n1)
+  M=$(sed -n 's/^[[:space:]]*mesh_trace_delta=//p' "$F3" | head -n1)
+  BG=$(sed -n 's/^[[:space:]]*baggage_bytes=//p' "$F3" | head -n1)
+  NC=$(sed -n 's/^[[:space:]]*nonce=//p' "$F3" | head -n1)
+  EC=$(sed -n 's/^[[:space:]]*echo=//p' "$F3" | head -n1)
   GRW=$(( ${#EC} - ${#NC} ))
   if [ "$G" = "769" ] && [ "$M" = "1537" ] && [ "$BG" = "512" ] && [ "$GRW" -eq 2306 ] 2>/dev/null; then
     ok "F3：注入链规格恢复（769/1537/512，回显增幅恰 2306）"; B_PASS=$((B_PASS+1))
@@ -162,7 +162,7 @@ else
 fi
 F4="$EV/F4_kafka_audit.txt"
 if [ -s "$F4" ]; then
-  ST=$(sed -n 's/^kafka_message_max_bytes_static=//p' "$F4" | head -n1 | grep -oE '[0-9]+' | head -n1)
+  ST=$(sed -n 's/^[[:space:]]*kafka_message_max_bytes_static=//p' "$F4" | head -n1 | grep -oE '[0-9]+' | head -n1)
   if [ -n "$ST" ] && [ "$ST" -gt 16384 ] 2>/dev/null; then
     ok "F4a：broker 静态限额落盘 ${ST} > 16384"; B_PASS=$((B_PASS+1))
   else
