@@ -6,8 +6,8 @@ schema_version = "1.3"
 # 由环境预置模板与 /app/collect_evidence.sh 脚手架支撑）作为可选加分项一并收集。
 # 判分环境不发实时探针，全部检查读取交付产物（见 tests/test.sh）。
 artifacts = [
-  "/app/ops/header_limits.env",
-  "/app/ops/",
+  "/app/ops/",  # 交付目录整体收集（含四产物 + warnings.log + evidence/）；
+                # 不可同时声明目录内的单文件，否则 Harbor 只保留首个声明、丢弃目录。
 ]
 
 [task]
@@ -16,9 +16,6 @@ version = "1.0"
 
 [agent]
 timeout_sec = 1200         # agent 解题的时间限制（秒），难题建议 900-1200
-max_turns = 100            # 单 trial 轮次预算；耗尽后判分按空作答兜底（reward.txt 恒为有效 0）。
-                           # 若 Harbor 0.23.0 schema 不支持该键，R1 lint 会提示，可移除——
-                           # 空作答零分兜底已由 tests/test.sh 开头保底写入保证。
 
 [environment]
 build_timeout_sec = 600
