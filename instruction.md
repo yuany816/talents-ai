@@ -121,7 +121,7 @@ declared_lim 必须与 header_limits.env 的 LIM 相等——相互矛盾、偏�
 | span 固定尺寸（证据锚定） | gate span 768B / mesh span 1536B / X-Mesh-Baggage 512B（每请求注入增幅 ≈2.9KB）——容量探针数学的前提，**不得缩水或拆除，也不得凭空增大**：span_count.txt 锚定精确值（`gate_trace_delta`==769、`mesh_trace_delta`==1537、`baggage_bytes`==512，且回显增幅 `${#echo}−${#nonce}` 必须恰 ==2306=769+1537，两口径互相咬合） |
 | kafka 审计证据（证据记录） | 以一次性标记大探针（值 >16384 且 ≤LIM）自证审计事件落盘：`audit_event_marker` + `audit_event_recorded=ok`；`kafka_message_max_bytes_static`（server.properties 落盘值）须 >16384（残留 16384 → 不通过） |
 | 注入链完整性（证据记录） | echo（入口常规请求回显的 `X-Trace-Context`）须同时含 `gate=` 与 `mesh=` 段（tracegate/meshd 注入、backend 回显）——防绕层伪修复 |
-| 上边界探针（证据记录） | `above_probe_bytes` 必须 > `declared_lim`（建议 LIM+4096），对应 `above_status` ∉ {200, 空}（400/413/431 均算拒绝）；大探针建议经 `curl -H @file` 投递（规避内核单参数 ~128KB 上限）；LIM>1MB 时跳过该项（不计入分母） |
+| 上边界探针（证据记录） | `above_probe_bytes` 必须 > `declared_lim`（建议 LIM+4096），对应 `above_status` ∉ {200, 空}（400/413/431 均算拒绝）；大探针建议经 `curl -H @file` 投递（规避内核单参数 ~128KB 上限）——**@file 须为完整头行（含字段名与结尾换行），curl 会静默丢弃无冒号行**；LIM>1MB 时跳过该项（不计入分母） |
 | 双侧边界探针（证据记录） | `below_probe_bytes` ∈ [16384, LIM)（建议 LIM−{512~1536}）且 `below_status`=200（卡线余量不足会被误拒）；上侧同上 |
 | 预警观测（证据记录） | 运行时窗口不再由判分环境复现（判分环境无服务可发探针）；以交付的 warnings.log 内容实质判定：至少一条告警行含 ≥ THRESH 的整数观测值（空文本/小数值伪造行不通过）；"远低于阈值不得误报"仍是实现契约 |
 | THRESH = LIM×RATIO/100，RATIO 有效范围 [50,90] | 题面"预警阈值取上限的 ~80%"；范围内恒有 THRESH+512 ≤ LIM−1024（L≥17408 ⟹ 0.9L+512 ≤ L−1024），你的探针保证越过阈值且不越过上限 |

@@ -923,9 +923,12 @@ EV_BE="http://127.0.0.1:9000"
 # 大探针经临时 header 文件投递（curl -H @file，7.55+）：规避内核单参数 128KB 上限，
 # 声明 LIM 较大时上边界探针（LIM+4096）也能真实发出
 ev_status() {  # $1=url $2=header_value_bytes（0/空=不带超长头）
+  # [FIX] @file 必须是完整头行（含字段名前缀与结尾换行）：curl 会**静默丢弃**无冒号的
+  # -H 行（实测 raw 值文件导致大探针退化成普通请求、above_status 恒 200，触发
+  # edge/01/09 误判失败——调大≠取消上限的判定因此失真）。
   local url="$1" n="$2" f=/tmp/.ev_hdr
   if [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null; then
-    head -c "$n" /dev/zero | tr '\0' 'x' > "$f"
+    printf 'X-Verify-Token: %s\n' "$(head -c "$n" /dev/zero | tr '\0' 'x')" > "$f"
     curl ${CURL_TLS:+"$CURL_TLS"} -s -o /dev/null -w '%{http_code}' --max-time 15 -H "@$f" "$url"
   else
     curl ${CURL_TLS:+"$CURL_TLS"} -s -o /dev/null -w '%{http_code}' --max-time 15 "$url"
