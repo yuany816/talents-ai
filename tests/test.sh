@@ -11,6 +11,7 @@
 export LC_ALL=C
 set -u
 
+TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REWARD_FILE="/logs/verifier/reward.txt"
 DEBUG_FILE="/logs/verifier/debug.txt"
 OPS="/app/ops"; EV="$OPS/evidence"; RP="$OPS/repro"; FX="$OPS/fix"
@@ -232,10 +233,42 @@ for f in F1 F2 F3 F4 F5; do
   fi
 done
 
-# ---------- 加权总分 ----------
-SCORE=$(awk "BEGIN{printf \"%.4f\", 0.20*$S_PASS/$S_TOTAL + 0.35*$B_PASS/$B_TOTAL + 0.20*$E_PASS/$E_TOTAL + 0.25*$Q_PASS/$Q_TOTAL}")
+# ---------- P1：运维修复清单（权重 0.15） ----------
+P1=$(awk "BEGIN{printf \"%.4f\", 0.20*$S_PASS/$S_TOTAL + 0.35*$B_PASS/$B_TOTAL + 0.20*$E_PASS/$E_TOTAL + 0.25*$Q_PASS/$Q_TOTAL}")
 echo "==================================================================="
-echo "[verifier] 结构=$S_PASS/$S_TOTAL 基础=$B_PASS/$B_TOTAL 证据=$E_PASS/$E_TOTAL 报告=$Q_PASS/$Q_TOTAL"
+echo "[verifier] P1 运维清单: 结构=$S_PASS/$S_TOTAL 基础=$B_PASS/$B_TOTAL 证据=$E_PASS/$E_TOTAL 报告=$Q_PASS/$Q_TOTAL → P1=$P1"
+
+# ---------- P2：F7 标定器实现（隐性对抗套件，权重 0.85） ----------
+# 规格见 /app/tools/specs/spec-calibrator.md；判分环境以 tests/bin/calibrator-ref 为
+# 参考实现，12 个复合场景逐字节对照 agent 交付的 /app/ops/bin/calibrator。
+F7_PASS=0; F7_TOTAL=0
+AGG="$OPS/bin/calibrator"
+REFBIN="/tests/bin/calibrator-ref"; [ -x "$REFBIN" ] || REFBIN="$TESTS_DIR/bin/calibrator-ref"
+GENBIN="/tests/bin/gen-calibrator"; [ -x "$GENBIN" ] || GENBIN="$TESTS_DIR/bin/gen-calibrator"
+THRESH_V=$(( ${LIM:-0} * ${RATIO:-0} / 100 ))
+if [ -n "$LIM" ] && [ -n "$RATIO" ] && [ -x "$AGG" ]; then
+  CASES=/tmp/f7cases
+  rm -rf "$CASES"; mkdir -p "$CASES"
+  SEED="trial-LIM=$LIM-RATIO=$RATIO-ht=$(grep -oE 'hidden.tracegate_factor=[0-9.]+' /app/ops/params.env 2>/dev/null)-hm=$(grep -oE 'hidden.mesh_factor=[0-9.]+' /app/ops/params.env 2>/dev/null)"
+  "$GENBIN" "$LIM" "$RATIO" "$SEED" "$CASES" "$REFBIN" >/dev/null 2>&1 || true
+  for cin in $(ls "$CASES"/sc*.in 2>/dev/null | sort); do
+    F7_TOTAL=$((F7_TOTAL+1))
+    "$AGG" "$THRESH_V" < "$cin" > /tmp/f7-agent.out 2>/dev/null || true
+    "$REFBIN" "$THRESH_V" < "$cin" > /tmp/f7-ref.out 2>/dev/null || true
+    if diff -q /tmp/f7-agent.out /tmp/f7-ref.out >/dev/null 2>&1; then
+      ok "F7 场景 $(basename "$cin") 逐字节一致"; F7_PASS=$((F7_PASS+1))
+    else
+      fail "F7 场景 $(basename "$cin") 输出不一致（规格角未实现或实现偏差）"
+    fi
+  done
+else
+  F7_TOTAL=12
+  fail "F7：/app/ops/bin/calibrator 缺失或不可执行，或 params.env 缺失——实现题 0 分"
+fi
+P2=$(awk "BEGIN{t=$F7_TOTAL; p=$F7_PASS; printf \"%.4f\", (t>0)?p/t:0}")
+
+# ---------- 加权总分：P1×0.15 + P2×0.85 ----------
+SCORE=$(awk "BEGIN{printf \"%.4f\", 0.15*$P1 + 0.85*$P2}")
 
 # ---------- CAP：repro 取证全缺 → 封顶 0.45 ----------
 REPRO_OK=0
