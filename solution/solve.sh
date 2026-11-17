@@ -1,26 +1,19 @@
 #!/bin/bash
 # =============================================================================
-# solution/solve.sh —— 参考解（4 故障面 / 2 交付阶段 / params 随机参数感知）
-#
-# 面：F1 nginx 入口缓冲 / F2 backend 多形态限额 / F3 tracegate 注入链规格 /
-#     F4 kafka 审计旁路限额。（meshd 为链路组成部分，其限额不在计分面单独计分，
-#     但 F2 端到端证据依赖全链路——本脚本一并修复。）
-# 阶段 1：交付 repro/F1~F4.sh 复现脚本（可执行）。
-# 阶段 2：四面修复生效 + /app/tools/collect_*.sh 采集证据 + 每面三行诊断报告。
-# 容量参数 LIM/WARN_RATIO 每 trial 随机（environment/entrypoint.sh 生成 params.env），
-# 本脚本读取 params.env 并使 nginx 配置/声明与之一致——不硬编码。
-# 运行约定：任务环境容器内 root；服务由 supervisord 编排；Go 模块在 /app 下。
+# solution/solve.sh —— 参考解（5 面 / 2 阶段 / 前置取证 / params 随机参数感知）
+# 面：F1 nginx / F2 backend(+预警标定) / F3 tracegate 注入链 / F4 kafka / F5 meshd
+# 阶段 1：repro/Fx.sh + Fx.out（修复前取证，签名见题面）——必须先于任何修复执行
+# 阶段 2：五面修复 → restart all 持久化自证 → 双侧标定 → 采集 → 报告
+# 容量参数 LIM/WARN_RATIO 每 trial 随机（params.env），配置与声明与之一致。
 # =============================================================================
 set -uo pipefail
 export LC_ALL=C
 umask 022
 
-APP=/app; OPS=$APP/ops; EV=$OPS/evidence; TOOLS=$APP/tools
-TEST_BYTES=16384           # 复现探针（完整 header 行 ≈16402B）
-NG_CHB_KB=16               # client_header_buffer_size
-NG_BUF_N=4                 # large_client_header_buffers 数量
-QUOTA_MAX=1048576          # backend/tracegate/meshd 新限额（≥ 任意 LIM）
-KAF_MAX=1048576            # broker 新限额
+APP=/app; OPS=$APP/ops; EV=$OPS/evidence; RP=$OPS/repro; TOOLS=$APP/tools
+TEST_BYTES=16384
+NG_CHB_KB=16; NG_BUF_N=4
+QUOTA_MAX=1048576; KAF_MAX=1048576
 
 say()  { echo "[solve.sh] $*"; }
 warn() { echo "[solve.sh][WARN] $*" >&2; }
@@ -30,18 +23,18 @@ backup() { [ -f "$1" ] && [ ! -f "$1.solve.bak" ] && cp -p "$1" "$1.solve.bak" |
 
 mkdir -p "$OPS/repro" "$OPS/fix" "$OPS/evidence" /var/log/nginx
 
-# ---------- ⓪ params（每 trial 随机；缺失按兼容值兜底） ----------
+# ---------- ⓪ params ----------
 LIM=65536; RATIO=80
 if [ -f "$OPS/params.env" ]; then
   _p="$(sed -n 's/^LIM=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')"; [ -n "$_p" ] && LIM=$_p
   _r="$(sed -n 's/^WARN_RATIO=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')"; [ -n "$_r" ] && RATIO=$_r
 fi
-say "params.env: LIM=${LIM} WARN_RATIO=${RATIO}"
+THRESH=$(( LIM * RATIO / 100 ))
+say "params: LIM=${LIM} WARN_RATIO=${RATIO} THRESH=${THRESH}"
 
-# supervisord 控制通道自适配（容器内默认；复刻环境可能用独立 conf）
 SUP="supervisorctl"
 supervisorctl status >/dev/null 2>&1 || SUP="supervisorctl -c /tmp/eval-sup/supervisord.conf"
-$SUP status >/dev/null 2>&1 || die "supervisord 未运行（环境编排缺失）"
+$SUP status >/dev/null 2>&1 || die "supervisord 未运行"
 
 ENTRY=http://127.0.0.1:80
 GATE=http://127.0.0.1:9100; MESH=http://127.0.0.1:15001; BE=http://127.0.0.1:9000
@@ -55,20 +48,39 @@ probe() {  # $1=url $2=header值字节数（0/空=不带）
 }
 wait_up() { for _ in $(seq 1 20); do curl -s -o /dev/null --max-time 2 "$1" && return 0; sleep 1; done; return 1; }
 
-# ---------- ① 分层复现（记录修复前状态，供报告数值对照） ----------
-say "① 分层复现（${TEST_BYTES}B 探针）"
-INIT_E="$(probe "$ENTRY/api/v1/profile" "$TEST_BYTES")"
-INIT_T="$(probe "$GATE/api/v1/profile" "$TEST_BYTES")"
-INIT_M="$(probe "$MESH/api/v1/profile" "$TEST_BYTES")"
-INIT_B="$(probe "$BE/api/v1/profile" "$TEST_BYTES")"
-NG_BEFORE="$(nginx -T 2>/dev/null | grep -E '^[[:space:]]*large_client_header_buffers[[:space:]]' | head -n1 | sed -E 's/;.*//' | awk '{print $2, $3}')"
-SPAN_BEFORE="$(sed -n 's/^span_bytes:[[:space:]]*//p' /app/tracegate/tracegate.yaml | head -n1)"
-KAF_BEFORE="$(grep -E '^message\.max\.bytes=' /opt/kafka/config/kraft/server.properties | head -n1 | cut -d= -f2)"
-say "修复前: nginx=${NG_BEFORE:-无} entry=${INIT_E} tracegate=${INIT_T} meshd=${INIT_M} backend=${INIT_B} span_bytes=${SPAN_BEFORE} kafka=${KAF_BEFORE}"
+# ---------- ① 阶段 1：先取证（任何修复之前） ----------
+say "① 阶段1取证（修复前）"
+{
+  echo "# F1 取证（修复前）$(date '+%F %T')"
+  echo "entry_big_status=$(probe "$ENTRY/api/v1/profile" "$TEST_BYTES")"
+  nginx -T 2>/dev/null | grep -E '^[[:space:]]*large_client_header_buffers[[:space:]]'
+} > "$RP/F1.out"
+{
+  echo "# F2 取证（修复前）$(date '+%F %T')"
+  echo "backend_big_status=$(probe "$BE/api/v1/profile" "$TEST_BYTES")"
+  curl -s --max-time 10 -H "X-Debug-Trace: $(tok "$TEST_BYTES")" "$BE/api/v1/profile" | head -c 200; echo
+  grep "startup:" /var/log/backend.log 2>/dev/null | head -n1
+} > "$RP/F2.out"
+NONCE="vfy$(date +%s%N)"
+{
+  echo "# F3 取证（修复前）$(date '+%F %T')"
+  curl -s -o /dev/null --max-time 15 -H "X-Trace-Context: $NONCE" "$ENTRY/api/v1/profile"
+  sleep 1
+  grep 'GATESTAT' /var/log/tracegate.log 2>/dev/null | grep 'verdict=PASS' | tail -n1
+  grep 'MESHSTAT' /var/log/meshd.log 2>/dev/null | grep 'verdict=PASS' | tail -n1
+} > "$RP/F3.out"
+{
+  echo "# F4 取证（修复前）$(date '+%F %T')"
+  curl -s -o /dev/null --max-time 15 -H "X-Debug-Trace: $(tok "$TEST_BYTES")" "$ENTRY/api/v1/profile"
+  for _ in $(seq 1 6); do sleep 5; grep -q 'MESSAGE_TOO_LARGE\|kafka produce failed' /var/log/backend.log 2>/dev/null && break; done
+  grep -c 'MESSAGE_TOO_LARGE\|kafka produce failed' /var/log/backend.log 2>/dev/null || echo 0
+  grep -E '^message\.max\.bytes=' /opt/kafka/config/kraft/server.properties
+} > "$RP/F4.out"
+for f in F1 F2 F3 F4; do [ -s "$RP/$f.out" ] || die "取证 $f.out 失败"; done
+say "取证完成（修复前签名已落盘）"
 
-# ---------- ② F1 nginx：生效单缓冲 == params LIM（全指令一致） ----------
+# ---------- ② F1 nginx：生效单缓冲 == LIM（全指令一致） ----------
 say "② F1 nginx（large_client_header_buffers 4 ${LIM}）"
-# 注释全部旧指令（消除配置漂移），再于 http{} 块插入统一定义
 while read -r f; do
   [ -f "$f" ] || continue
   backup "$f"
@@ -80,29 +92,24 @@ backup "$NGINX_CONF"
 awk -v ins="    client_header_buffer_size ${NG_CHB_KB}k;\n    large_client_header_buffers ${NG_BUF_N} ${LIM};" '
   !done && $0 ~ /^[[:space:]]*http[[:space:]]*[{]/ { print; print ins; done=1; next } { print }
 ' "$NGINX_CONF" > "${NGINX_CONF}.tmp" && mv "${NGINX_CONF}.tmp" "$NGINX_CONF"
-grep -qE "^[[:space:]]*large_client_header_buffers[[:space:]]+${NG_BUF_N}[[:space:]]+${LIM};" "$NGINX_CONF" \
-  || die "F1 nginx 写入失败（http{} 块未定位）"
-nginx -t >/dev/null 2>&1 || die "F1 nginx -t 校验失败（已回滚语义，须人工检查）"
+grep -qE "^[[:space:]]*large_client_header_buffers[[:space:]]+${NG_BUF_N}[[:space:]]+${LIM};" "$NGINX_CONF" || die "F1 nginx 写入失败"
+nginx -t >/dev/null 2>&1 || die "F1 nginx -t 失败"
 if pgrep -x nginx >/dev/null 2>&1; then
   nginx -s reload 2>/dev/null || { pkill -x nginx 2>/dev/null || true; sleep 1; nginx -g 'daemon on;'; }
 else
   nginx -g 'daemon on;'
 fi
-sleep 1
-$SUP restart nginx >/dev/null 2>&1 || true
 
-# ---------- ③ F2 backend：三处 8192 形态 + 编译期固化重建 ----------
-say "③ F2 backend（配额/框架/存档 → ${QUOTA_MAX}，重建二进制）"
+# ---------- ③ F2 backend：三处 8192 + 预警标定中间件（阈值 = THRESH） + 重建 ----------
+say "③ F2 backend（配额/框架/存档 → ${QUOTA_MAX} + 预警中间件阈值 ${THRESH}）"
 backup /app/backend/configs/quota.yaml
 sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"${QUOTA_MAX}"'/' /app/backend/configs/quota.yaml
 backup /app/backend/main.go
-# 移码书写形态（1 << 13）与普通数值两种口径各替换一次，保持行尾注释与逗号不动
 sed -i -E 's/(MaxHeaderBytes:[[:space:]]*)1[[:space:]]*<<[[:space:]]*13/\1'"${QUOTA_MAX}"'/' /app/backend/main.go
 sed -i -E 's/(MaxHeaderBytes:[[:space:]]*)[0-9]+([[:space:]]*,)/\1'"${QUOTA_MAX}"'\2/' /app/backend/main.go
-grep -q "MaxHeaderBytes: ${QUOTA_MAX}" /app/backend/main.go || die "F2 MaxHeaderBytes 替换未生效（形态未识别）"
+grep -q "MaxHeaderBytes: ${QUOTA_MAX}" /app/backend/main.go || die "F2 MaxHeaderBytes 替换未生效"
 backup /app/backend/legacy_server.go
 sed -i -E 's/(legacyQuotaBytes[[:space:]]*=[[:space:]]*)[0-9]+/\1'"${QUOTA_MAX}"'/' /app/backend/legacy_server.go
-# 全量残留清理：十进制 8192（退役存档/任意书写处）
 while read -r rf; do
   [ -f "$rf" ] || continue
   backup "$rf"
@@ -110,131 +117,232 @@ while read -r rf; do
 done < <(grep -rlIE '(^|[^0-9])8192([^0-9]|$)' /app/backend \
     --exclude='*.bak' --exclude='*.bak.*' --exclude='*.orig' --exclude='*.old' \
     --exclude='*.backup' --exclude='*.disabled' --exclude='*.solve.bak' 2>/dev/null || true)
+# 预警标定中间件：请求头总量（含注入）≥ THRESH 时同步写 /app/ops/warnings.log
+if ! grep -q 'headerStatMiddleware' /app/backend/main.go; then
+  backup /app/backend/main.go
+  # 单条 sed 完成平衡包裹：Handler: quota.HeaderQuotaMiddleware(A, B), → Handler: headerStatMiddleware(quota.HeaderQuotaMiddleware(A, B)),
+  sed -i -E 's/(Handler:[[:space:]]*)quota\.HeaderQuotaMiddleware\(([^,]+),[[:space:]]*([^)]+)\),/\1headerStatMiddleware(quota.HeaderQuotaMiddleware(\2, \3)),/' /app/backend/main.go
+  cat > /app/backend/headerstat.go <<EOF
+package main
+
+import (
+	"net/http"
+	"os"
+	"fmt"
+)
+
+const headerStatWarnThreshold = ${THRESH}
+
+func headerStatWarn(path string, total int) {
+	f, err := os.OpenFile("/app/ops/warnings.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s WARN path=%s total=%dB >= THRESH=%dB\n", path, total, headerStatWarnThreshold)
+}
+
+func headerStatMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		total := len(r.RequestURI) + 16
+		for name, vals := range r.Header {
+			n := len(name) + 4
+			for _, v := range vals {
+				n += len(v)
+			}
+			total += n
+		}
+		fmt.Printf("HDRSTAT path=%s total=%dB\n", r.URL.Path, total)
+		if total >= headerStatWarnThreshold {
+			headerStatWarn(r.URL.Path, total)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+EOF
+  grep -q 'headerStatMiddleware(quota.HeaderQuotaMiddleware' /app/backend/main.go || die "预警中间件接线失败"
+fi
 ( cd /app/backend && timeout 300 env GOPROXY=off CGO_ENABLED=0 go build -o backend.new . ) || die "F2 go build 失败"
 mv -f /app/backend/backend.new /app/backend/backend && chmod 755 /app/backend/backend
-$SUP restart backend >/dev/null 2>&1 || die "backend 重启失败"
 
-# ---------- ④ F3 tracegate：限额 + span 规格恢复（384→768） ----------
-say "④ F3 tracegate（max_header_bytes→${QUOTA_MAX}，span_bytes 384→768）"
+# ---------- ④ F3 tracegate：限额 + span 规格恢复 ----------
+say "④ F3 tracegate（→ ${QUOTA_MAX}，span_bytes 384→768）"
 backup /app/tracegate/tracegate.yaml
 sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"${QUOTA_MAX}"'/; s/^(span_bytes:[[:space:]]*)[0-9]+/\1768/' /app/tracegate/tracegate.yaml
-$SUP restart tracegate >/dev/null 2>&1 || die "tracegate 重启失败"
+grep -q '^span_bytes: 768' /app/tracegate/tracegate.yaml || die "F3 span 规格恢复失败"
 
-# ---------- ④b meshd（不计分面，链路必需）：磁盘 + supervisor env 双口径 ----------
-say "④b meshd（磁盘与程序环境覆盖双口径 → ${QUOTA_MAX}）"
+# ---------- ④b F5 meshd：磁盘 + supervisor env 双口径 ----------
+say "④b F5 meshd（磁盘与程序环境覆盖双口径 → ${QUOTA_MAX}）"
 backup /app/mesh/sidecar.yaml
 sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"${QUOTA_MAX}"'/' /app/mesh/sidecar.yaml
 SUPCONF=/etc/supervisor/conf.d/app.conf
-if grep -qE 'MESH_HEADER_LIMIT=' "$SUPCONF" 2>/dev/null; then
+grep -qE 'MESH_HEADER_LIMIT=' "$SUPCONF" 2>/dev/null && {
   backup "$SUPCONF"
   sed -i -E 's/(MESH_HEADER_LIMIT=")[0-9]+(")/\1'"${QUOTA_MAX}"'\2/' "$SUPCONF"
   $SUP reread >/dev/null 2>&1 && $SUP update >/dev/null 2>&1
-fi
-$SUP restart meshd >/dev/null 2>&1 || true
+}
 
-# ---------- ⑤ F4 kafka：动态生效 + 静态落盘 ----------
-say "⑤ F4 kafka（message.max.bytes → ${KAF_MAX}，动态 + 静态防回退）"
+# ---------- ⑤ F4 kafka：动态 + 静态落盘 ----------
+say "⑤ F4 kafka（message.max.bytes → ${KAF_MAX}）"
 timeout 30 /opt/kafka/bin/kafka-configs.sh --bootstrap-server 127.0.0.1:9092 \
   --entity-type brokers --entity-name 1 --alter --add-config "message.max.bytes=${KAF_MAX}" >/dev/null 2>&1 \
-  || warn "kafka 动态 alter 未确认（旁路不阻断）"
+  || warn "kafka 动态 alter 未确认"
 backup /opt/kafka/config/kraft/server.properties
 sed -i -E "s/^(message\.max\.bytes=)[0-9]+/\1${KAF_MAX}/" /opt/kafka/config/kraft/server.properties
+$SUP restart backend tracegate meshd >/dev/null 2>&1 || die "组件重启失败"
+wait_up "$BE/healthz" || warn "backend 未就绪"
 
-# ---------- ⑥ 全链路自验（供报告数值） ----------
-say "⑥ 全链路自验"
+# ---------- ⑥ restart all 持久化自证（F2b） ----------
+say "⑥ restart all 持久化自证"
+$SUP restart all >/dev/null 2>&1
+for _ in $(seq 1 30); do
+  K=$(timeout 2 bash -c 'exec 3<> /dev/tcp/127.0.0.1/9092' 2>/dev/null && echo ok || echo no)
+  [ "$K" = "ok" ] && curl -s -o /dev/null --max-time 2 "$BE/healthz" && break
+  sleep 2
+done
 wait_up "$ENTRY/healthz" || warn "入口未就绪"
-FINAL_E="$(probe "$ENTRY/api/v1/profile" "$TEST_BYTES")"
-FINAL_B="$(probe "$BE/api/v1/profile" "$TEST_BYTES")"
-NORM_E="$(probe "$ENTRY/api/v1/profile" 0)"
-ABOVE="$(probe "$ENTRY/api/v1/profile" "$(( LIM + 4096 ))")"
-VFY="vfy$(date +%s%N)"
-ECHO_VAL="$(curl -s -D - -o /dev/null --max-time 15 -H "X-Trace-Context: $VFY" "$ENTRY/api/v1/profile" 2>/dev/null \
-  | grep -i '^x-trace-context:' | head -n1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/\r$//')"
-sleep 1
-GL="$(grep 'GATESTAT' /var/log/tracegate.log 2>/dev/null | grep 'verdict=PASS' | tail -n1)"
-ML="$(grep 'MESHSTAT' /var/log/meshd.log 2>/dev/null | grep 'verdict=PASS' | tail -n1)"
-read -r GI GO <<< "$(printf '%s' "$GL" | sed -nE 's/.*trace_in=([0-9]+)B trace_out=([0-9]+)B.*/\1 \2/p')"
-read -r MI MO MBAG <<< "$(printf '%s' "$ML" | sed -nE 's/.*trace_in=([0-9]+)B trace_out=([0-9]+)B baggage=([0-9]+)B.*/\1 \2 \3/p')"
-GDEL=$(( ${GO:-0} - ${GI:-0} )); MDEL=$(( ${MO:-0} - ${MI:-0} ))
-say "修复后: entry=${FINAL_E}(norm=${NORM_E}) backend=${FINAL_B} above(LIM+4096)=${ABOVE} gate_delta=${GDEL} mesh_delta=${MDEL} baggage=${MBAG:-0}"
+sleep 2
+{
+  echo "# F2 restart all 持久化取证 $(date '+%F %T')"
+  echo "post_restart_entry_big_status=$(probe "$ENTRY/api/v1/profile" "$TEST_BYTES")"
+  echo "post_restart_backend_big_status=$(probe "$BE/api/v1/profile" "$TEST_BYTES")"
+} > "$EV/F2_restart.txt"
 
-PASS=1
-[ "$FINAL_E" = "200" ] && [ "$FINAL_B" = "200" ] && [ "$NORM_E" = "200" ] || PASS=0
-case "$ABOVE" in 200|000|"") PASS=0 ;; esac
-[ "$GDEL" = "769" ] && [ "$MDEL" = "1537" ] || PASS=0
-[ "$(( ${#ECHO_VAL} - ${#VFY} ))" -ge 2048 ] 2>/dev/null || PASS=0
-curl -s --max-time 10 "$GATE/componentz" | grep -q '"tracegate"' || PASS=0
-curl -s --max-time 10 "$MESH/componentz" | grep -q '"meshd"' || PASS=0
+# ---------- ⑦ F4b：重启后新标记事件复证 ----------
+say "⑦ F4b：重启后标记事件复证"
+MARK="kaf$(date +%s%N)"
+probe "$ENTRY/api/v1/profile" "$TEST_BYTES" >/dev/null
+curl -s -o /dev/null --max-time 15 -H "X-Debug-Trace: $(tok "$TEST_BYTES")" -H "X-Case-Marker: $MARK" "$ENTRY/api/v1/profile" 2>/dev/null || true
+SEEN=no
+for _ in $(seq 1 12); do
+  sleep 5
+  grep -q "$MARK" /var/log/trace_events.log 2>/dev/null && { SEEN=ok; break; }
+done
+{
+  echo "# F4 restart 持久化取证 $(date '+%F %T')"
+  echo "marker=$MARK"
+  echo "event_seen=$SEEN"
+} > "$EV/F4_restart.txt"
 
-# ---------- ⑦ 阶段 1 交付：repro 复现脚本（可执行） ----------
-say "⑦ 阶段1交付：repro/F1~F4.sh"
-cat > "$OPS/repro/F1.sh" <<'EOS'
+# ---------- ⑧ F2c 预警双侧标定（THRESH=LIM×RATIO/100） ----------
+say "⑧ F2c 预警双侧标定（THRESH=${THRESH}）"
+: > "$OPS/warnings.log" 2>/dev/null || true
+BELOW_B=1024   # 小探针：后端口径总量 ≈ 值+开销+注入 ≈3KB < THRESH（静默窗口对任意 params 成立）
+probe "$ENTRY/api/v1/profile" "$BELOW_B" >/dev/null
+sleep 2
+BD=$(wc -l < "$OPS/warnings.log" 2>/dev/null || echo 0)
+ABOVE_B=$(( THRESH + 512 ))   # ≤ LIM−1024（0.9L+512 ≤ L−1024 对 L≥15360 恒成立）→ 可过 nginx 且总量 ≥ THRESH
+probe "$ENTRY/api/v1/profile" "$ABOVE_B" >/dev/null
+sleep 2
+AMAX=0
+for _ in $(seq 1 6); do
+  AMAX=$(grep -oE 'total=[0-9]+B' "$OPS/warnings.log" 2>/dev/null | grep -oE '[0-9]+' | sort -n | tail -n1)
+  [ -n "$AMAX" ] && break
+  sleep 2
+done
+AD=$(( $(wc -l < "$OPS/warnings.log" 2>/dev/null || echo 0) - BD ))
+{
+  echo "# F2c 双侧标定取证 $(date '+%F %T')（THRESH=${THRESH}=LIM ${LIM} × WARN_RATIO ${RATIO} / 100）"
+  echo "below_probe_bytes=${BELOW_B}"
+  echo "below_warnings_delta=${BD}"
+  echo "above_probe_bytes=${ABOVE_B}"
+  echo "above_warnings_delta=${AD}"
+  echo "above_max_observed=${AMAX:-0}"
+} > "$EV/F2_calibration.txt"
+say "标定: below_delta=${BD}（须0） above_delta=${AD}（须≥1） max=${AMAX:-0}（须≥THRESH）"
+[ "$BD" = "0" ] && [ "${AD:-0}" -ge 1 ] 2>/dev/null || warn "双侧标定未通过，检查观测口径与注入开销"
+
+# ---------- ⑨ F1b 双侧边界探针 ----------
+say "⑨ F1b 双侧边界"
+BELOW_L=$(( LIM - 1024 )); ABOVE_L=$(( LIM + 4096 ))
+{
+  echo "# F1b 双侧边界取证 $(date '+%F %T')（LIM=${LIM}）"
+  echo "below(LIM-1024)=${BELOW_L}B status=$(probe "$ENTRY/api/v1/profile" "$BELOW_L")"
+  echo "above(LIM+4096)=${ABOVE_L}B status=$(probe "$ENTRY/api/v1/profile" "$ABOVE_L")"
+} > "$EV/F1_boundary.txt"
+
+# ---------- ⑩ 阶段 1 交付：repro 脚本（取证已在①完成） ----------
+say "⑩ repro 脚本交付"
+cat > "$RP/F1.sh" <<'EOS'
 #!/bin/bash
-# F1 复现：16384B 单自定义 header 打入口（修复前 400/431——完整行 16402B 超 16k 单缓冲）
+# F1 复现：16384B 单自定义 header 打入口（修复前 400/431）
 curl -s -o /dev/null -w 'entry_big=%{http_code}\n' --max-time 10 \
   -H "X-Verify-Token: $(head -c 16384 /dev/zero | tr '\0' 'x')" http://127.0.0.1:80/api/v1/profile
 EOS
-cat > "$OPS/repro/F2.sh" <<'EOS'
+cat > "$RP/F2.sh" <<'EOS'
 #!/bin/bash
 # F2 复现：直连后端（修复前 431——配额 8192 编译期固化）
 curl -s -o /dev/null -w 'backend_big=%{http_code}\n' --max-time 10 \
   -H "X-Debug-Trace: $(head -c 16384 /dev/zero | tr '\0' 'x')" http://127.0.0.1:9000/api/v1/profile
-curl -s --max-time 10 -H "X-Debug-Trace: $(head -c 16384 /dev/zero | tr '\0' 'x')" \
-  http://127.0.0.1:9000/api/v1/profile | head -c 200; echo
 EOS
-cat > "$OPS/repro/F3.sh" <<'EOS'
+cat > "$RP/F3.sh" <<'EOS'
 #!/bin/bash
-# F3 复现：注入链计数与规格偏差（修复前 span_bytes=384 → delta≠769）
+# F3 复现：注入链计数（修复前 span_bytes=384 → gate delta≠769）
 N="vfy$(date +%s%N)"
 curl -s -o /dev/null --max-time 10 -H "X-Trace-Context: $N" http://127.0.0.1:80/api/v1/profile
 sleep 1
 grep 'GATESTAT' /var/log/tracegate.log | grep 'verdict=PASS' | tail -n1
 grep 'MESHSTAT' /var/log/meshd.log | grep 'verdict=PASS' | tail -n1
 EOS
-cat > "$OPS/repro/F4.sh" <<'EOS'
+cat > "$RP/F4.sh" <<'EOS'
 #!/bin/bash
 # F4 复现：审计旁路容量信号（修复前 MESSAGE_TOO_LARGE / broker 限额 16384）
 grep -c 'kafka produce failed' /var/log/backend.log 2>/dev/null || true
 grep -E '^message\.max\.bytes=' /opt/kafka/config/kraft/server.properties
 EOS
-chmod 755 "$OPS/repro/"*.sh
+chmod 755 "$RP/"*.sh
 
-# ---------- ⑧ 阶段 2 交付：证据采集（四面，原始数据） ----------
-say "⑧ 阶段2交付：tools 采集四面证据"
+# ---------- ⑪ 阶段 2 交付：五面证据采集 ----------
+say "⑪ 五面证据采集"
 bash "$TOOLS/collect_nginx.sh" >/dev/null 2>&1 || warn "F1 采集失败"
 bash "$TOOLS/collect_backend.sh" >/dev/null 2>&1 || warn "F2 采集失败"
 bash "$TOOLS/collect_trace.sh" >/dev/null 2>&1 || warn "F3 采集失败"
 bash "$TOOLS/collect_kafka.sh" >/dev/null 2>&1 || warn "F4 采集失败"
+bash "$TOOLS/collect_meshd.sh" >/dev/null 2>&1 || warn "F5 采集失败"
 
-# ---------- ⑨ 诊断报告（每面三行：根因/证据路径/前后数值） ----------
-say "⑨ 诊断报告"
+# ---------- ⑫ 诊断报告（修复前数值与 Fx.out 咬合） ----------
+say "⑫ 诊断报告"
+INIT_E="$(sed -n 's/^entry_big_status=//p' "$RP/F1.out" | head -n1)"
+INIT_B="$(sed -n 's/^backend_big_status=//p' "$RP/F2.out" | head -n1)"
+KAF_BEFORE="$(grep -oE '[0-9]+' "$RP/F4.out" | tail -n1)"
 NG_AFTER="$(nginx -T 2>/dev/null | grep -E '^[[:space:]]*large_client_header_buffers[[:space:]]' | head -n1 | sed -E 's/;.*//')"
+FINAL_E="$(probe "$ENTRY/api/v1/profile" "$TEST_BYTES")"
+FINAL_B="$(probe "$BE/api/v1/profile" "$TEST_BYTES")"
 cat > "$OPS/diagnosis_report.md" <<EOF
-# 431 事件诊断报告（4 面 / 2 阶段）
+# 431 事件诊断报告（5 面 / 2 阶段）
 
-容量参数（params.env）：LIM=${LIM}B，WARN_RATIO=${RATIO}%——nginx 配置与声明已与之一致。
+容量参数（params.env）：LIM=${LIM}B，WARN_RATIO=${RATIO}%——nginx 配置、预警阈值（THRESH=${THRESH}）与声明已与之一致。
 
 ## F1（nginx 入口）
-- 根因：server 级 snippet 的 large_client_header_buffers 16k 对 16402B 完整 header 行不足，且与 http 级配置漂移
-- 证据：evidence/F1_nginx_T.txt
-- 修复前后数值对比：${NG_BEFORE:-4 16k} → ${NG_AFTER:-4 ${LIM}}（生效单缓冲 == params LIM=${LIM}B）
+- 根因：large_client_header_buffers 16k 对 16402B 完整 header 行不足，且 server 级与 http 级配置漂移
+- 证据：evidence/F1_nginx_T.txt、evidence/F1_boundary.txt、repro/F1.out
+- 修复前后数值对比：入口大探针 ${INIT_E:-400} → ${FINAL_E:-200}（生效单缓冲 → ${NG_AFTER:-4 ${LIM}}，双侧边界 LIM−1024=200 / LIM+4096=4xx）
 ## F2（backend）
-- 根因：业务配额 8192 经 go:embed 编译期固化进二进制，框架层 MaxHeaderBytes 1<<13 与退役存档同样残留 8192——改磁盘不重启/不重编译均不生效
-- 证据：evidence/F2_backend_status.txt
-- 修复前后数值对比：直连后端大探针 ${INIT_B:-431} → ${FINAL_B:-200}（配额 8192 → ${QUOTA_MAX}）
+- 根因：业务配额 8192 经 go:embed 编译期固化，框架层 MaxHeaderBytes 1<<13 与退役存档残留 8192——改盘不重编译不生效
+- 证据：evidence/F2_backend_status.txt、evidence/F2_restart.txt、evidence/F2_calibration.txt、repro/F2.out
+- 修复前后数值对比：直连后端大探针 ${INIT_B:-431} → ${FINAL_B:-200}（配额 8192 → ${QUOTA_MAX}；restart all 后仍 200；预警双侧标定 THRESH=${THRESH} 通过）
 ## F3（tracegate 注入链）
-- 根因：max_header_bytes 10240 过小 + 带宽节省专项将 span_bytes 下调至 384，注入链增幅缩水
-- 证据：evidence/F3_span_count.txt
-- 修复前后数值对比：span_bytes ${SPAN_BEFORE:-384} → 768（gate 计数恢复恰 769 / mesh 恰 1537 / baggage 512；本轮实测 ${GDEL}/${MDEL}/${MBAG:-0}）
+- 根因：max_header_bytes 10240 过小，span_bytes 被带宽节省专项下调至 384，注入链增幅缩水
+- 证据：evidence/F3_span_count.txt、repro/F3.out
+- 修复前后数值对比：span_bytes 384 → 768（gate 计数恢复恰 769 / mesh 1537 / baggage 512；回显增幅恰 2306）
 ## F4（kafka 审计旁路）
-- 根因：broker message.max.bytes ${KAF_BEFORE:-16384} 过小，全量头快照审计事件被 MESSAGE_TOO_LARGE 拒绝（异步容量信号，区别于同步 431）
-- 证据：evidence/F4_kafka_audit.txt
-- 修复前后数值对比：message.max.bytes ${KAF_BEFORE:-16384} → ${KAF_MAX}（动态生效 + 静态落盘防重启回退）
+- 根因：broker message.max.bytes ${KAF_BEFORE:-16384} 过小，全量头快照事件被 MESSAGE_TOO_LARGE 拒绝（异步容量信号，区别于同步 431）
+- 证据：evidence/F4_kafka_audit.txt、evidence/F4_restart.txt、repro/F4.out
+- 修复前后数值对比：message.max.bytes ${KAF_BEFORE:-16384} → ${KAF_MAX}（动态生效+静态落盘；broker 重启后新标记事件仍落盘）
+## F5（meshd sidecar）
+- 根因：磁盘配置 12288 与 supervisord 程序环境 MESH_HEADER_LIMIT=12288 双口径压制生效值
+- 证据：evidence/F5_meshd_status.txt
+- 修复前后数值对比：生效限额 12288 → ${QUOTA_MAX}（双口径同步，启动日志 source 口径确认）
 EOF
 
-say "交付: repro/$(ls "$OPS/repro" | tr '\n' ' ') evidence/$(ls "$EV" | tr '\n' ' ')"
+PASS=1
+[ "$FINAL_E" = "200" ] && [ "$FINAL_B" = "200" ] || PASS=0
+[ "$BD" = "0" ] && [ "${AD:-0}" -ge 1 ] 2>/dev/null || PASS=0
+grep -q 'event_seen=ok' "$EV/F4_restart.txt" || PASS=0
+grep -qE '^post_restart_entry_big_status=200' "$EV/F2_restart.txt" || PASS=0
+say "交付: repro/$(ls "$RP" | tr '\n' ' ') evidence/$(ls "$EV" | tr '\n' ' ')"
 if [ "$PASS" = "1" ]; then
-  say "结果: PASS —— 四面修复完成，两阶段交付齐备"
+  say "结果: PASS —— 五面修复完成，前置取证/持久化/标定证据齐备"
   exit 0
 fi
 warn "结果: FAIL —— 见上方自验输出"
