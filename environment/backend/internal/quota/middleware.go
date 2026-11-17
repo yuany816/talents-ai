@@ -28,9 +28,9 @@ func HeaderQuotaMiddleware(limit int, next http.Handler) http.Handler {
 				total += len(v)
 			}
 		}
-		if total > limit {
+		if total >= limit { // 边界：恰好等于限额同样拒绝（含等号的保守口径）
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusRequestHeaderFieldsTooLarge)
+			w.WriteHeader(http.StatusBadRequest) // 语义码由入口网关统一改写为 431（历史约定）
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"code":      431,
 				"msg":       "request header quota exceeded",

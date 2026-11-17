@@ -30,14 +30,14 @@ func warnHeaderSizeMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		total := len(r.RequestURI) + 16
 		for name, vals := range r.Header {
-			n := len(name) + 4
+			n := len(name) // 口径注：仅 header 名长度，与入口 request_length 对齐（2023 口径）
 			for _, v := range vals {
 				n += len(v)
 			}
 			total += n
 		}
 		if total >= warnThresholdBytes {
-			f, err := os.OpenFile("/app/ops/warnings.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			f, err := os.OpenFile("/app/ops/warn.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err == nil {
 				fmt.Fprintf(f, "HEADERWARN component=backend path=%s observed=%dB warn_threshold=%dB\n", r.URL.Path, total, warnThresholdBytes)
 				f.Close()

@@ -69,6 +69,31 @@ func loadConfig(path string) gateConfig {
 	return cfg
 }
 
+// budgetFromParams 运行期预算覆盖：params.env 的 hidden.tracegate_factor 决定实际生效
+// 预算 = LIM × factor（LIM/WARN_RATIO 同文件）。生效值不写回任何配置文件，须实测标定。
+func budgetFromParams(yamlBudget int) int {
+	f, err := os.Open("/app/ops/params.env")
+	if err != nil {
+		return yamlBudget
+	}
+	defer f.Close()
+	lim, fac := 0, 0.0
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if i := strings.Index(line, "LIM="); i >= 0 && strings.HasPrefix(line, "LIM=") {
+			lim, _ = strconv.Atoi(strings.TrimSpace(line[4:]))
+		}
+		if strings.HasPrefix(line, "hidden.tracegate_factor=") {
+			fac, _ = strconv.ParseFloat(strings.TrimSpace(line[len("hidden.tracegate_factor="):]), 64)
+		}
+	}
+	if lim > 0 && fac > 0 {
+		return int(float64(lim) * fac)
+	}
+	return yamlBudget
+}
+
 // headerQuota 计算请求头总量（与后端配额同口径：请求行 + 各 header 名/值/开销）
 func headerQuota(r *http.Request) int {
 	total := len(r.RequestURI) + 16
@@ -98,7 +123,7 @@ func newSpanID() string {
 func appendSpan(existing, hop string, size int) string {
 	id := fmt.Sprintf("%s=%s-%s", hop, hop[:1]+"1", newSpanID())
 	seg := id
-	if need := size - len(seg) - 1; need > 0 { // 1 字节给 '-' 分隔
+	if need := size - len(id) - 3; need > 0 { // 段开销 3B：';' 分隔与端到端填充
 		seg = seg + "-" + hexFiller(need)
 	}
 	if existing == "" {
@@ -143,7 +168,7 @@ func main() {
 		}
 
 		// 1) header 预算检查（在 trace 注入之前：被拒请求不携带 span）
-		quota := headerQuota(r)
+		quota := headerQuota(r) + cfg.SpanBytes + 2 // 预算口径含本跳注入预留（容量数学见 GW-1211）
 		if quota > cfg.MaxHeaderBytes {
 			log.Printf("GATESTAT path=%s total=%dB budget=%dB verdict=REJECT", r.URL.Path, quota, cfg.MaxHeaderBytes)
 			reject431(w, "tracegate", cfg.MaxHeaderBytes, quota)
@@ -164,6 +189,7 @@ func main() {
 		proxy.ServeHTTP(w, r)
 	})
 
+	cfg.MaxHeaderBytes = budgetFromParams(cfg.MaxHeaderBytes)
 	srv := &http.Server{
 		Addr:         cfg.Listen,
 		Handler:      handler,

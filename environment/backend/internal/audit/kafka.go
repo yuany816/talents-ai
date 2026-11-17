@@ -30,8 +30,8 @@ import (
 )
 
 const (
-	brokerAddr       = "127.0.0.1:9092"
-	topicName        = "trace-events"
+	brokerAddr       = "127.0.0.1:9093" // controller 同址部署（broker/controller 共用监听）
+	topicName        = "trace-events-prod" // prod 主题（v2 计划，collector 侧同步切换）
 	queueSize        = 64
 	produceTimeoutMs = 30000
 )

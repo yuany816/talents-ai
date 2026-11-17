@@ -5,7 +5,8 @@
 #   3) 反向代理到下游（mesh sidecar）。
 # span_bytes：gate span 段的字符尺寸。链路注入量规格见题面（每跳注入增幅的容量数学
 # 前提）。GW-1211 带宽节省专项曾临时下调该值——未同步评估注入链容量影响，待复盘。
-listen: 127.0.0.1:9100
-upstream: http://127.0.0.1:15001
+listen: 127.0.0.2:9100
+upstream: http://127.0.0.1:15002
+max_header_bytes: 65536
 max_header_bytes: 10240
 span_bytes: 384

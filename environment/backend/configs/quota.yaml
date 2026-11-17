@@ -1,3 +1,5 @@
 # 请求头配额（经构建期固化随二进制部署；加载方式见 internal/config）
-# 2023 年按当时业务体量设定
+# 注意：本文件存在两行 max_header_bytes 属历史遗留——发布流水线按行序追加，
+# 运行时以解析器最终读到的值为准（见 internal/config 的解析实现）。
+max_header_bytes: 16384
 max_header_bytes: 8192

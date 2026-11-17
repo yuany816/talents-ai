@@ -94,6 +94,9 @@ awk -v ins="    client_header_buffer_size ${NG_CHB_KB}k;\n    large_client_heade
   !done && $0 ~ /^[[:space:]]*http[[:space:]]*[{]/ { print; print ins; done=1; next } { print }
 ' "$NGINX_CONF" > "${NGINX_CONF}.tmp" && mv "${NGINX_CONF}.tmp" "$NGINX_CONF"
 grep -qE "^[[:space:]]*large_client_header_buffers[[:space:]]+${NG_BUF_N}[[:space:]]+${LIM};" "$NGINX_CONF" || die "F1 nginx 写入失败"
+# app.conf 双故障点修复：恢复被注释的 snippet include + 删除误清注入头的 proxy_set_header
+sed -i -E 's|^([[:space:]]*)#[[:space:]]*(include /etc/nginx/snippets/headers.conf;)|\1\2|' /etc/nginx/conf.d/app.conf
+sed -i '\#proxy_set_header X-Trace-Context "";#d' /etc/nginx/conf.d/app.conf
 nginx -t >/dev/null 2>&1 || die "F1 nginx -t 失败"
 if pgrep -x nginx >/dev/null 2>&1; then
   nginx -s reload 2>/dev/null || { pkill -x nginx 2>/dev/null || true; sleep 1; nginx -g 'daemon on;'; }
@@ -111,6 +114,13 @@ sed -i -E 's/(MaxHeaderBytes:[[:space:]]*)[0-9]+([[:space:]]*,)/\1'"${QUOTA_MAX}
 grep -q "MaxHeaderBytes: ${QUOTA_MAX}" /app/backend/main.go || die "F2 MaxHeaderBytes 替换未生效"
 backup /app/backend/legacy_server.go
 sed -i -E 's/(legacyQuotaBytes[[:space:]]*=[[:space:]]*)[0-9]+/\1'"${QUOTA_MAX}"'/' /app/backend/legacy_server.go
+# 观测口径/落盘路径/边界符号/响应码/审计双端 六处源码级修复
+sed -i 's/n := len(name) \/\/ 口径/n := len(name) + 4 \/\/ 口径/' /app/backend/main.go
+sed -i 's#/app/ops/warn\.log#/app/ops/warnings.log#' /app/backend/main.go
+sed -i 's/total >= limit/total > limit/' /app/backend/internal/quota/middleware.go
+sed -i 's/http\.StatusBadRequest/http.StatusRequestHeaderFieldsTooLarge/' /app/backend/internal/quota/middleware.go
+sed -i 's/127\.0\.0\.1:9093/127.0.0.1:9092/' /app/backend/internal/audit/kafka.go
+sed -i 's/trace-events-prod/trace-events/' /app/backend/internal/audit/kafka.go
 while read -r rf; do
   [ -f "$rf" ] || continue
   backup "$rf"
@@ -124,17 +134,32 @@ grep -q "const warnThresholdBytes = ${THRESH}" /app/backend/main.go || die "预�
 ( cd /app/backend && timeout 300 env GOPROXY=off CGO_ENABLED=0 go build -o backend.new . ) || die "F2 go build 失败"
 mv -f /app/backend/backend.new /app/backend/backend && chmod 755 /app/backend/backend
 
-# ---------- ④ F3 tracegate：限额 + span 规格恢复 ----------
-say "④ F3 tracegate（→ ${QUOTA_MAX}，span_bytes 384→768）"
+# ---------- ④ F3 tracegate：限额 + span 规格恢复 + 注入偏移推导修正 ----------
+say "④ F3 tracegate（预算→${QUOTA_MAX}，span_bytes 384→768，注入偏移修正）"
 backup /app/tracegate/tracegate.yaml
 sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"${QUOTA_MAX}"'/; s/^(span_bytes:[[:space:]]*)[0-9]+/\1768/' /app/tracegate/tracegate.yaml
+# 推导型缺陷：appendSpan 的段开销写死为 -3B（实际恰为 -1B）——只改 span_bytes=768
+# 得到的逐跳增幅是 767 而非 769，须修正代码使注入尺寸与规格精确一致（误导注释见源码）
+backup /app/tracegate/main.go
+sed -i -E 's/size - len\(id\) - 3/size - len(id) - 1/' /app/tracegate/main.go
+sed -i 's/headerQuota(r) + cfg.SpanBytes + 2/headerQuota(r)/' /app/tracegate/main.go
+sed -i 's/127\.0\.0\.2:9100/127.0.0.1:9100/' /app/tracegate/tracegate.yaml
+sed -i 's#upstream: http://127.0.0.1:15002#upstream: http://127.0.0.1:15001#' /app/tracegate/tracegate.yaml
+grep -q 'size - len(id) - 1' /app/tracegate/main.go || die "F3 注入偏移修正失败"
+( cd /app/tracegate && timeout 120 env GOPROXY=off CGO_ENABLED=0 go build -o tracegate . ) || die "F3 tracegate 重编译失败"
 grep -q '^span_bytes: 768' /app/tracegate/tracegate.yaml || die "F3 span 规格恢复失败"
 
-# ---------- ④b F5 meshd：磁盘 + supervisor env 双口径 + span 规格恢复 ----------
-say "④b F5 meshd（限额双口径 → ${QUOTA_MAX}；span_bytes 2048→1536）"
+# ---------- ④b F5 meshd：磁盘 + supervisor env 双口径 + span 规格与偏移修正 ----------
+say "④b F5 meshd（限额双口径 → ${QUOTA_MAX}；span_bytes 2048→1536；注入偏移修正）"
 backup /app/mesh/sidecar.yaml
 sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"${QUOTA_MAX}"'/; s/^(span_bytes:[[:space:]]*)[0-9]+/\11536/' /app/mesh/sidecar.yaml
 grep -q '^span_bytes: 1536' /app/mesh/sidecar.yaml || die "F5 mesh span 规格恢复失败"
+backup /app/mesh/main.go
+sed -i -E 's/size - len\(seg\) - 2/size - len(seg) - 1/' /app/mesh/main.go
+sed -i 's/if cfg.BaggageBytes == 0 {/if cfg.BaggageBytes > 0 {/' /app/mesh/main.go
+sed -i 's/len(grown), len(bg)/len(grown), cfg.BaggageBytes/' /app/mesh/main.go
+grep -q 'size - len(seg) - 1' /app/mesh/main.go || die "F5 mesh 注入偏移修正失败"
+( cd /app/mesh && timeout 120 env GOPROXY=off CGO_ENABLED=0 go build -o meshd . ) || die "F5 meshd 重编译失败"
 SUPCONF=/etc/supervisor/conf.d/app.conf
 grep -qE 'MESH_HEADER_LIMIT=' "$SUPCONF" 2>/dev/null && {
   backup "$SUPCONF"
@@ -149,6 +174,10 @@ timeout 30 /opt/kafka/bin/kafka-configs.sh --bootstrap-server 127.0.0.1:9092 \
   || warn "kafka 动态 alter 未确认"
 backup /opt/kafka/config/kraft/server.properties
 sed -i -E "s/^(message\.max\.bytes=)[0-9]+/\1${KAF_MAX}/" /opt/kafka/config/kraft/server.properties
+# 主题建制：auto.create.topics.enable=false（OPS-SEC-443）——显式建立审计主题
+timeout 30 /opt/kafka/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --create --if-not-exists \
+  --topic trace-events --partitions 1 --replication-factor 1 >/dev/null 2>&1 \
+  || warn "topic 建制失败/已存在（非阻断，复证时检查）"
 # collector 消费口径与 producer 对齐（topic 错配则审计事件永不落盘）
 grep -q 'trace-events-v2' "$SUPCONF" 2>/dev/null && {
   sed -i 's/--topic trace-events-v2/--topic trace-events/' "$SUPCONF"

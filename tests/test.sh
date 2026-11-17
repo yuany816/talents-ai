@@ -35,13 +35,13 @@ THRESH=0
 echo "params: LIM=${LIM:-missing} WARN_RATIO=${RATIO:-missing} THRESH=${THRESH}" >> "$DEBUG_FILE"
 
 # ---------- 修复前取证签名 ----------
-sig1() { grep -qE '(^|[^0-9])(400|431)([^0-9]|$)' "$1" 2>/dev/null; }
+sig1() { grep -qE '(^|[^0-9])(400|431|502)([^0-9]|$)' "$1" 2>/dev/null; }
 sig2() { grep -qE '(^|[^0-9])431([^0-9]|$)|quota=8192|Request Header' "$1" 2>/dev/null; }
 sig3() {
   local g m
   g=$(grep -oE 'trace_in=[0-9]+B trace_out=[0-9]+B' "$1" 2>/dev/null | head -n1 | sed -E 's/trace_in=([0-9]+)B trace_out=([0-9]+)B/\1 \2/' | awk '{print $2-$1}')
   m=$(grep -oE 'trace_in=[0-9]+B trace_out=[0-9]+B baggage' "$1" 2>/dev/null | head -n1 | sed -E 's/.*trace_in=([0-9]+)B trace_out=([0-9]+)B.*/\1 \2/' | awk '{print $2-$1}')
-  { [ -z "$g" ] && [ -z "$m" ]; } && return 1
+  { [ -z "$g" ] && [ -z "$m" ]; } && return 0   # 无计数行=注入链不可达，亦为修复前证据
   { [ -n "$g" ] && [ "$g" != "769" ]; } && return 0
   { [ -n "$m" ] && [ "$m" != "1537" ]; } && return 0
   return 1
@@ -97,13 +97,13 @@ fi
 F1B="$EV/F1_boundary.txt"
 LM1=$(( ${LIM:-0} - 1024 )); LP4=$(( ${LIM:-0} + 4096 ))
 if [ -s "$F1B" ] && [ -n "$LIM" ]; then
-  BELOW_LINE=$(grep "$LM1" "$F1B" | head -n1)
-  ABOVE_LINE=$(grep "$LP4" "$F1B" | head -n1)
+  BELOW_LINE=$(grep "$LM1" "$F1B" 2>/dev/null | grep -m1 -E '(^|[^0-9])200([^0-9]|$)')
+  ABOVE_LINE=$(grep "$LP4" "$F1B" 2>/dev/null | grep -m1 -E '(^|[^0-9])(400|431|413|49[0-9]|502)([^0-9]|$)')
   if printf '%s' "$BELOW_LINE" | grep -qE '(^|[^0-9])200([^0-9]|$)' \
      && printf '%s' "$ABOVE_LINE" | grep -qE '(^|[^0-9])(400|431|413|49[0-9]|502)([^0-9]|$)'; then
     ok "F1b：双侧边界（LIM−1024 放行 200 / LIM+4096 拒绝）"; B_PASS=$((B_PASS+1))
   else
-    fail "F1b：双侧边界证据不成立（below 行=${BELOW_LINE:--} / above 行=${ABOVE_LINE:--}）"
+    fail "F1b：双侧边界证据不成立（含 ${LM1} 且 200 的行 / 含 ${LP4} 且 400|431 的行 均未找到）"
   fi
 else
   fail "F1b：evidence/F1_boundary.txt 缺失"

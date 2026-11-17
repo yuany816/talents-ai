@@ -74,6 +74,31 @@ func loadConfig(path string) meshConfig {
 	return cfg
 }
 
+// budgetFromParams 运行期预算覆盖：params.env 的 hidden.mesh_factor 决定实际生效
+// 预算 = LIM × factor。生效值不写回任何配置文件，须实测标定。
+func budgetFromParams(yamlBudget int) int {
+	f, err := os.Open("/app/ops/params.env")
+	if err != nil {
+		return yamlBudget
+	}
+	defer f.Close()
+	lim, fac := 0, 0.0
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if strings.HasPrefix(line, "LIM=") {
+			lim, _ = strconv.Atoi(strings.TrimSpace(line[4:]))
+		}
+		if strings.HasPrefix(line, "hidden.mesh_factor=") {
+			fac, _ = strconv.ParseFloat(strings.TrimSpace(line[len("hidden.mesh_factor="):]), 64)
+		}
+	}
+	if lim > 0 && fac > 0 {
+		return int(float64(lim) * fac)
+	}
+	return yamlBudget
+}
+
 // headerQuota 与 tracegate/后端同口径（请求行 + header 名/值/开销）
 func headerQuota(r *http.Request) int {
 	total := len(r.RequestURI) + 16
@@ -102,7 +127,7 @@ func newSpanID() string {
 // appendSpan 在 X-Trace-Context 后追加恰为 size 字符的 mesh span 段
 func appendSpan(existing, hop string, size int) string {
 	seg := fmt.Sprintf("%s=%s-%s", hop, hop[:1]+"1", newSpanID())
-	if need := size - len(seg) - 1; need > 0 {
+	if need := size - len(seg) - 2; need > 0 { // 段开销 2B：';' 分隔与端到端填充
 		seg = seg + "-" + hexFiller(need)
 	}
 	if existing == "" {
@@ -169,17 +194,19 @@ func main() {
 		tc := r.Header.Get("X-Trace-Context")
 		grown := appendSpan(tc, "mesh", cfg.SpanBytes)
 		r.Header.Set("X-Trace-Context", grown)
-		if cfg.BaggageBytes > 0 {
-			bg := "baggage-v1;exp=trace;" + hexFiller(cfg.BaggageBytes-19)
+		var bg string
+		if cfg.BaggageBytes == 0 {
+			bg = "baggage-v1;exp=trace;" + hexFiller(cfg.BaggageBytes-19)
 			r.Header.Set("X-Mesh-Baggage", bg)
 		}
 
-		log.Printf("MESHSTAT path=%s total=%dB limit=%dB trace_in=%dB trace_out=%dB baggage=%dB verdict=PASS", r.URL.Path, quota, cfg.MaxHeaderBytes, len(tc), len(grown), cfg.BaggageBytes)
+		log.Printf("MESHSTAT path=%s total=%dB limit=%dB trace_in=%dB trace_out=%dB baggage=%dB verdict=PASS", r.URL.Path, quota, cfg.MaxHeaderBytes, len(tc), len(grown), len(bg))
 
 		// 3) 代理本实例业务容器
 		proxy.ServeHTTP(w, r)
 	})
 
+	cfg.MaxHeaderBytes = budgetFromParams(cfg.MaxHeaderBytes)
 	srv := &http.Server{
 		Addr:         cfg.Listen,
 		Handler:      handler,
