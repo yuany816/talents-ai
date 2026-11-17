@@ -896,6 +896,10 @@ ${ROW_QUOTA}
 本次已调至 ${APP_QUOTA_MAX}；源码/配置中 8192 的等值书写形态（移码/十六进制）与退役入口存档中的残留常量一并纳入清理
 （本次命中文件：${ORIG_FAULT_FILES:-无}；MaxHeaderBytes 原书写形态：${APP_LIMIT_BEFORE}）。
 
+中间层原故障值口径：tracegate（接入网关 trace 插件）max_header_bytes 原值 10240、
+meshd（mesh 数据面 sidecar）max_header_bytes 原值 12288——均为配置驱动（进程启动时
+读取，修改后重启对应组件即生效），本次已统一调至 ${APP_QUOTA_MAX}（逐项修改前值见上表）。
+
 ## 3. Header 体量归因（谁注入过多）
 ${ATTR_DETAIL}
 - 入口实测（nginx \$request_length）：${ENTRY_LEN}
