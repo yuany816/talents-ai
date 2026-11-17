@@ -45,7 +45,8 @@
   - F2.out：**431** 或 backend banner **quota=8192** 或 Request Header 拒绝记录；
   - F3.out：GATESTAT/MESHSTAT 原始计数行，且 gate 增幅 **≠769** 或 mesh 增幅 **≠1537**
     （修复后的规格值不算取证）；
-  - F4.out：**MESSAGE_TOO_LARGE** / kafka produce failed / 原限额 16384 记录。
+  - F4.out：**MESSAGE_TOO_LARGE** / kafka produce failed / 原限额 16384 记录；
+  - F5.out：meshd 生效限额 **< 17408**（修复前磁盘与部署环境双口径未达标）。
 
 **阶段 2（修复 + 证据 + 报告）**：
 1. 五面修复真实生效（nginx 配置 reload、Go 源码重编译并重启、中间层改后重启组件、
@@ -58,7 +59,7 @@
    bash /app/tools/collect_kafka.sh     # → evidence/F4_kafka_audit.txt（限额+事件流）
    bash /app/tools/collect_meshd.sh     # → evidence/F5_meshd_status.txt（生效限额+来源）
    ```
-   另须模型自产三份核验记录（格式见"验题契约"）：
+   另须模型自产四份核验记录（格式见"验题契约"）：
    - `evidence/F1_boundary.txt`：双侧边界探针——LIM−1024 须 200、LIM+4096 须 400/431；
    - `evidence/F2_restart.txt`：`supervisorctl restart all` **之后**的复探记录
      （post_restart_entry_big_status=200 / post_restart_backend_big_status=200）；
@@ -66,20 +67,24 @@
      THRESH+512 探针必须触发告警（above_warnings_delta≥1 且观测值≥THRESH），
      THRESH−1024 探针必须静默（below_warnings_delta=0）——观测口径与注入开销的
      关系需要你自己想清楚；
-   - `evidence/F4_restart.txt`：重启 kafka 后以**新标记**探针复证事件仍落盘（marker=/event_seen=ok）。
-3. **diagnosis_report.md**：每个面三行——根因一句话、所引用的证据文件相对路径、
+   - `evidence/F4_restart.txt`：重启 kafka 后以**新标记**探针复证事件仍落盘（marker=/event_seen=ok）；
+   - `evidence/F5_restart.txt`：restart all 之后重跑 collect_meshd.sh 的输出
+     （effective_limit 须仍 ≥17408）。
+3. **fix/ 修复脚本交付**：`fix/F1.sh ~ F5.sh` 五个可执行脚本，各自封装该面的修复动作
+   （判分按存在且可执行计结构分；内容须与实际生效的修复一致）；
+4. **diagnosis_report.md**：每个面三行——根因一句话、所引用的证据文件相对路径、
    修复前后一个关键数值对比（修复前数值须与 Fx.out 实测一致）。
 
 ## 验题契约（tests/test.sh 的精确行为）
 **判定总则**：独立判分（判分环境无服务，只读 /app/ops/）。4 位小数写入
 /logs/verifier/reward.txt，诊断写 /logs/verifier/debug.txt。
-`reward = 0.15×结构(/5) + 0.30×基础(/9) + 0.35×证据(/5) + 0.20×报告(/2)`：
+`reward = 0.20×结构(/10) + 0.35×基础(/10) + 0.20×证据(/5) + 0.25×报告(/5)`：
 
 | 维度 | 子项 | 判定 |
 |---|---|---|
-| 结构 /5 | repro/Fx.sh + Fx.out ×4 | 可执行 且 .out 含对应修复前签名（见上表） |
-| | diagnosis_report.md | 存在且非空 |
-| 基础 /9 | F1a | nginx_T 全部活动指令单缓冲 == params LIM（多条须一致；硬编码不通过） |
+| 结构 /10 | repro/Fx.sh + Fx.out ×5 | 可执行 且 .out 含对应修复前签名（见上表；F5 签名=生效限额 <17408） |
+| | fix/Fx.sh ×5 | 存在且可执行（封装该面实际修复动作） |
+| 基础 /10 | F1a | nginx_T 全部活动指令单缓冲 == params LIM（多条须一致；硬编码不通过） |
 | | F1b | F1_boundary：LIM−1024 行含 200、LIM+4096 行含 400/431 |
 | | F2a | backend_big_status=200 且 entry_big_status=200 且响应体 `"msg":"ok"` |
 | | F2b | F2_restart：post_restart_entry/backend_big_status=200 |
@@ -88,8 +93,9 @@
 | | F4a | kafka_message_max_bytes_static > 16384 |
 | | F4b | F4_restart：含 marker= 且 event_seen=ok |
 | | F5a | F5_meshd_status：effective_limit ≥ 17408 |
+| | F5b | F5_restart：effective_limit ≥ 17408（restart all 后仍生效） |
 | 证据 /5 | F1~F5 | evidence/ 下各有至少一个 `Fx_*` 文件 |
-| 报告 /2 | ①引用证据路径 ②修复前数值咬合 | ②=报告至少出现 8192/10240/12288/384/16384 中的 4 个真实故障值 |
+| 报告 /5 | 逐面引用 | 报告逐面引用 evidence/Fx_* 证据文件相对路径（F1~F5 各计 1 项） |
 
 - **CAP**：repro 取证项全缺 → 总分封顶 0.45；**兜底**：启动即写 0.0000，/app/ops 缺失即 0 退出。
 - 记录间互相咬合（回显增幅 vs 逐层计数、修复前数值 vs 故障面实际），相互矛盾按不通过计。

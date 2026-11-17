@@ -76,7 +76,8 @@ NONCE="vfy$(date +%s%N)"
   grep -c 'MESSAGE_TOO_LARGE\|kafka produce failed' /var/log/backend.log 2>/dev/null || echo 0
   grep -E '^message\.max\.bytes=' /opt/kafka/config/kraft/server.properties
 } > "$RP/F4.out"
-for f in F1 F2 F3 F4; do [ -s "$RP/$f.out" ] || die "取证 $f.out 失败"; done
+bash "$TOOLS/collect_meshd.sh" > "$RP/F5.out" 2>&1 || warn "F5 取证采集失败"
+for f in F1 F2 F3 F4 F5; do [ -s "$RP/$f.out" ] || die "取证 $f.out 失败"; done
 say "取证完成（修复前签名已落盘）"
 
 # ---------- ② F1 nginx：生效单缓冲 == LIM（全指令一致） ----------
@@ -207,6 +208,9 @@ sleep 2
   echo "post_restart_entry_big_status=$(probe "$ENTRY/api/v1/profile" "$TEST_BYTES")"
   echo "post_restart_backend_big_status=$(probe "$BE/api/v1/profile" "$TEST_BYTES")"
 } > "$EV/F2_restart.txt"
+bash "$TOOLS/collect_meshd.sh" > /dev/null 2>&1
+cp "$EV/F5_meshd_status.txt" "$EV/F5_restart.txt" 2>/dev/null || {
+  echo "effective_limit=0"; } > "$EV/F5_restart.txt"
 
 # ---------- ⑦ F4b：重启后新标记事件复证 ----------
 say "⑦ F4b：重启后标记事件复证"
@@ -290,7 +294,56 @@ cat > "$RP/F4.sh" <<'EOS'
 grep -c 'kafka produce failed' /var/log/backend.log 2>/dev/null || true
 grep -E '^message\.max\.bytes=' /opt/kafka/config/kraft/server.properties
 EOS
+cat > "$RP/F5.sh" <<'EOS'
+#!/bin/bash
+# F5 复现：meshd 生效限额口径（修复前 12288 < 17408——磁盘与部署环境双口径）
+bash /app/tools/collect_meshd.sh
+EOS
 chmod 755 "$RP/"*.sh
+
+# fix/ 修复脚本交付（封装各面实际修复动作，幂等可重跑）
+cat > "$OPS/fix/F1.sh" <<'EOS'
+#!/bin/bash
+# F1 修复：nginx 生效单缓冲对齐 params LIM（全指令一致）后 reload
+LIM=$(sed -n 's/^LIM=//p' /app/ops/params.env | head -n1 | tr -dc '0-9'); : "${LIM:=65536}"
+sed -i -E 's/^([[:space:]]*)(client_header_buffer_size|large_client_header_buffers)/\1# disabled: &/' /etc/nginx/snippets/headers.conf
+sed -i -E "s/^(large_client_header_buffers[[:space:]]+)[0-9]+[[:space:]]+[0-9kKmM]+;/\14 ${LIM};/" /etc/nginx/nginx.conf
+nginx -t && nginx -s reload
+EOS
+cat > "$OPS/fix/F2.sh" <<'EOS'
+#!/bin/bash
+# F2 修复：配额与框架限额对齐 params，重编译并重启
+QUOTA=1048576
+sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"$QUOTA"'/' /app/backend/configs/quota.yaml
+sed -i -E 's/(MaxHeaderBytes:[[:space:]]*)1[[:space:]]*<<[[:space:]]*13/\1'"$QUOTA"'/' /app/backend/main.go
+sed -i -E 's/(legacyQuotaBytes[[:space:]]*=[[:space:]]*)[0-9]+/\1'"$QUOTA"'/' /app/backend/legacy_server.go
+cd /app/backend && GOPROXY=off CGO_ENABLED=0 go build -o backend . && supervisorctl restart backend
+EOS
+cat > "$OPS/fix/F3.sh" <<'EOS'
+#!/bin/bash
+# F3 修复：tracegate 预算与 span 规格恢复（768）
+Q=1048576
+sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"$Q"'/; s/^(span_bytes:[[:space:]]*)[0-9]+/\1768/' /app/tracegate/tracegate.yaml
+supervisorctl restart tracegate
+EOS
+cat > "$OPS/fix/F4.sh" <<'EOS'
+#!/bin/bash
+# F4 修复：broker 限额动态生效 + 静态落盘
+KAF_MAX=1048576
+kafka-configs() { /opt/kafka/bin/kafka-configs.sh "$@"; }
+timeout 30 kafka-configs --bootstrap-server 127.0.0.1:9092 --entity-type brokers --entity-name 1 \
+  --alter --add-config "message.max.bytes=${KAF_MAX}"
+sed -i -E "s/^(message\.max\.bytes=)[0-9]+/\1${KAF_MAX}/" /opt/kafka/config/kraft/server.properties
+EOS
+cat > "$OPS/fix/F5.sh" <<'EOS'
+#!/bin/bash
+# F5 修复：meshd 磁盘与部署环境双口径对齐后重启
+Q=1048576
+sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"$Q"'/' /app/mesh/sidecar.yaml
+sed -i -E 's/(MESH_HEADER_LIMIT=")[0-9]+(")/\1'"$Q"'\2/' /etc/supervisor/conf.d/app.conf
+supervisorctl reread && supervisorctl update && supervisorctl restart meshd
+EOS
+chmod 755 "$OPS/fix/"*.sh
 
 # ---------- ⑪ 阶段 2 交付：五面证据采集 ----------
 say "⑪ 五面证据采集"
