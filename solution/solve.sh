@@ -11,6 +11,10 @@
 #                        覆盖，优先级高于磁盘 yaml——须对齐 supervisor 配置并 reread/update
 #             L4 backend：net/http MaxHeaderBytes(1<<13) + go:embed 固化的业务配额(8192)
 #                        （需改源码/配置并重新编译打包）
+#             L5 tracegate span 注入：span_bytes 被临时下调至 384（链路注入量规格要求
+#                        768/1536/512），注入链增幅探针与逐层计数核验会失败——须恢复规格
+#             L6 kafka 审计旁路：message.max.bytes=16384 过小，审计事件（全量头快照）
+#                        被拒（MESSAGE_TOO_LARGE）——计入评分（计数维度），须治理
 #           异步旁路：backend → Kafka(message.max.bytes=16384 过小) → trace-collector；
 #           审计事件携带全量请求头快照，超限被拒（MESSAGE_TOO_LARGE）——与同步 431
 #           无关，属排查噪声与容量信号，本脚本一并治理（非奖励项）。
@@ -409,6 +413,34 @@ if [ -n "$SUP_CONF" ] && grep -qE '^\[program:meshd\]' "$SUP_CONF" 2>/dev/null; 
 else
   ORIG_MESH_ENV=""
   warn "未定位 [program:meshd] 的 supervisord 配置——若 meshd 生效限额仍异常请人工核查部署环境"
+fi
+
+# 4.7 tracegate span 注入规格恢复（链路第 5 层故障）：
+#     tracegate.yaml 的 span_bytes 被临时下调（GW-1211 带宽节省专项），低于链路注入量
+#     规格要求的 gate span=768B（题面"注入链 span 固定尺寸"，每跳注入增幅 ≈2.9KB 的
+#     容量数学前提）。注入链增幅探针（nonce→gate→mesh 增幅 ≥2048B）与逐层计数核验
+#     （GATESTAT trace_out−trace_in 精确 == 769）都会失败。此处幂等恢复至规格值；
+#     span_bytes 在进程启动时读取，随步骤⑥重启生效。
+TG_YAML="/app/tracegate/tracegate.yaml"
+TRACEGATE_SPAN_SPEC=768
+SPAN_RESTORED=0
+if [ -f "$TG_YAML" ]; then
+  SPAN_BEFORE="$(grep -hoE '^span_bytes:[[:space:]]*[0-9]+' "$TG_YAML" | head -n1 | grep -oE '[0-9]+$')"
+  if [ "$SPAN_BEFORE" != "$TRACEGATE_SPAN_SPEC" ]; then
+    backup "$TG_YAML"
+    sed -i -E "s/^span_bytes:[[:space:]]*[0-9]+/span_bytes: ${TRACEGATE_SPAN_SPEC}/" "$TG_YAML"
+    if grep -qE "^span_bytes:[[:space:]]*${TRACEGATE_SPAN_SPEC}\$" "$TG_YAML"; then
+      SPAN_RESTORED=1; CHAIN_CFG_CHANGED=1
+      say ">> tracegate span_bytes 已恢复规格: ${SPAN_BEFORE:-?} → ${TRACEGATE_SPAN_SPEC}（注入链容量数学前提）"
+    else
+      warn "span_bytes 规格恢复未确认，请人工检查 $TG_YAML"
+    fi
+  else
+    SPAN_RESTORED=1
+    say ">> tracegate span_bytes 已符合规格（${TRACEGATE_SPAN_SPEC}）"
+  fi
+else
+  warn "未找到 $TG_YAML——span 规格恢复跳过（若注入链核验失败请人工核查）"
 fi
 
 # 4.4 注入逐 header 体积统计中间件（归因观测：哪个模块/header 注入过多）
@@ -950,7 +982,10 @@ ${ROW_QUOTA}
 控制面下发，优先级高于 sidecar.yaml——仅改 yaml 并 restart 时生效值仍为覆盖值，"已书写"≠
 "已生效"），本次已将磁盘配置与运行时覆盖统一调至 ${APP_QUOTA_MAX}（supervisor 变更经
 reread && update 被编排进程接管后随重启生效；覆盖原值 ${MESH_ENV_BEFORE:-未设置}；
-逐项修改前值见上表）。
+逐项修改前值见上表）。此外，tracegate 的 gate span 注入尺寸（span_bytes）曾按 GW-1211
+带宽节省专项临时下调至 ${SPAN_BEFORE:-384}，低于链路注入量规格（gate span 768B）——
+注入链增幅与逐层计数核验因此失真，本次已恢复规格值 ${TRACEGATE_SPAN_SPEC}
+（恢复前值 ${SPAN_BEFORE:-384}，见下表 GATESTAT 逐层计数）。
 
 ## 3. Header 体量归因（谁注入过多）
 ${ATTR_DETAIL}
@@ -971,8 +1006,8 @@ ${ATTR_DETAIL}
 - 后端模块：${MOD_DIR}（${L2_KEY} 见 ${WIRE_FILE##*/}）；中间层：/app/tracegate/tracegate.yaml、/app/mesh/sidecar.yaml
 
 ## 6. 异步审计旁路（Kafka）三角说明
-- Kafka message.max.bytes：${KAF_MSG_BEFORE:-未知} → ${KAF_MSG_NEW}（${KAF_HOW}）
-- 故障期表现：审计事件携带**全量请求头快照**（探针场景约 17-60KB），超过 broker 限额被拒，
+- Kafka message.max.bytes（原故障值 16384）：${KAF_MSG_BEFORE:-未知} → ${KAF_MSG_NEW}（${KAF_HOW}；动态调整已同步落盘静态配置，防重启回退）
+- 故障期表现：审计事件携带**全量请求头快照**（探针场景约 17-60KB），超过 broker 原限额（message.max.bytes=16384）被拒，
   backend 日志出现 \`kafka produce failed: ... error_code=10(MESSAGE_TOO_LARGE)\`（治理前采样 ${KAF_NOISE_BEFORE} 条）
 - 三角结论：MESSAGE_TOO_LARGE 是**异步审计链路**的容量信号，与同步链路 431 的拦截层不同——
   排障时应分流处置：同步 431 逐层定位（本报告第 1-2 节），异步容量信号对齐 broker 限额（本节）
@@ -998,6 +1033,9 @@ mesh_max_header_bytes=${MESH_LIMIT:-NA}
 mesh_env_override_before=${MESH_ENV_BEFORE:-NA}
 mesh_env_override_after=${MESH_LIMIT:-NA}
 mesh_env_patched=${MESH_ENV_PATCHED}
+tracegate_span_bytes_before=${SPAN_BEFORE:-NA}
+tracegate_span_bytes=${TRACEGATE_SPAN_SPEC}
+span_restored=${SPAN_RESTORED}
 kafka_message_max_bytes=${KAF_MSG_NEW}
 kafka_message_max_bytes_before=${KAF_MSG_BEFORE:-NA}
 kafka_altered_dynamic=${KAF_ALTERED}

@@ -4,7 +4,10 @@
 set -u
 . "$(dirname "$0")/../lib.sh"
 [ -x "$GATE" ] || { fail "缺少质检门禁 $GATE"; exit 1; }
-echo "127.0.0.1 - - [$(date '+%d/%b/%Y:%H:%M:%S +0000')] \"GET /injected HTTP/1.1\" 431 0 \"-\" \"verifier\"" >> /var/log/nginx/access.log
+# 注入标记随机化：路径/字节数/时间戳每轮不同——门禁须按"431 状态"语义拦截，而非匹配固定样本
+INJ_PATH="/injected-$RANDOM$RANDOM"
+INJ_BYTES=$(( 123 + RANDOM % 8000 ))
+echo "127.0.$((RANDOM%256)).$((RANDOM%256)) - - [$(date '+%d/%b/%Y:%H:%M:%S +0000')] \"GET $INJ_PATH HTTP/1.1\" 431 $INJ_BYTES \"-\" \"verifier-$RANDOM\"" >> /var/log/nginx/access.log
 if bash "$GATE" >/dev/null 2>&1; then
   fail "质检门禁：access.log 注入 431 后未拦截"
   : > /var/log/nginx/access.log

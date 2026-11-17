@@ -9,10 +9,12 @@ if [ -z "$LIM" ] || [ "$LIM" -le 4096 ] 2>/dev/null || [ "$LIM" -gt 1048576 ] 2>
   note "LIM 缺失/超 1MB，跳过上边界检查"
   exit 3
 fi
-over=$(( LIM + 4096 ))
+# 探针锚定值随机化：越界偏移每轮取 {2048,4096,8192} 之一——固定值猜测无效
+UPPER_OFF=$(( 2048 + RANDOM % 3 * 3072 ))
+over=$(( LIM + UPPER_OFF ))
 obig=$(gen_token "$over")
 over_code=$(code_with_header "$ENTRY/api/v1/profile" "$obig")
 case "$over_code" in
-  200|000) fail "超上限请求未被拒绝（status=$over_code）"; exit 1 ;;
-  *)       ok "超上限请求仍被拒绝（status=$over_code）"; exit 0 ;;
+  200|000) fail "超上限请求未被拒绝（status=$over_code，LIM+${UPPER_OFF}）"; exit 1 ;;
+  *)       ok "超上限请求仍被拒绝（status=$over_code，LIM+${UPPER_OFF}）"; exit 0 ;;
 esac
