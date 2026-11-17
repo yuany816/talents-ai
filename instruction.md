@@ -17,6 +17,7 @@
 - 路由：/api/v1/profile、/healthz；中间层有 /componentz 组件探针
 - 日志：/var/log/nginx/（error log 已开 info 级）、/var/log/{backend,tracegate,meshd,kafka,trace_events}.log
 - 服务管理：supervisord 编排（全组件 autorestart）；`supervisorctl status`（需 root）
+- **平台以 100 轮（agent 交互轮次）为预算强制截断**，截断后按已落盘交付物计分——没写完的文件就是没有分；全部面修复+取证+证据+报告的工作量需要高效推进（先取证、后修复、随做随落盘）
 - **容量参数随 trial 随机生成**于 `/app/ops/params.env`（`LIM` ∈ [17408,65535] 字节、
   `WARN_RATIO` ∈ [50,90] 整数百分比）——nginx 配置、预警阈值与相关声明必须与该文件一致，
   **硬编码固定值由一致性检查扣分**
@@ -27,11 +28,11 @@
 ## 五个故障面（判分按面计分）
 | 面 | 组件 | 说明 |
 |---|---|---|
-| F1 | nginx 入口 | header 缓冲对完整 header 行（16384B 探针 + 开销 ≈18B）口径不足；配置漂移风险 |
-| F2 | backend | 限额存在多处形态（标准库/框架层/业务配额/存档），生效值可能与磁盘不一致 |
+| F1 | nginx 入口（业务 :80 + 管理 :8081） | header 缓冲对完整 header 行（16384B 探针 + 开销 ≈18B）口径不足；**多 server 多处指令**的历史漂移（业务面/管理面/http 级可能各自不同） |
+| F2 | backend | 限额存在多处形态（标准库/框架层/业务配额/存档），生效值可能与磁盘不一致；**内置预警阈值硬编码**未与容量参数联动 |
 | F3 | tracegate 注入链 | header 预算与 span 注入规格（gate 768B / mesh 1536B / baggage 512B） |
-| F4 | kafka 审计旁路 | broker 限额与全量头快照事件的容量关系（与同步 431 区分的独立信号） |
-| F5 | meshd sidecar | 数据面限额的生效口径（磁盘 vs 部署环境覆盖） |
+| F4 | kafka 审计旁路（broker + trace-collector） | broker 限额与全量头快照事件的容量关系；**生产/消费的 topic 口径**是否一致（与同步 431 区分的独立信号） |
+| F5 | meshd sidecar | 数据面限额与 span 注入规格的生效口径（磁盘 vs 部署环境覆盖；规格 1536B/512B） |
 
 链路的注入行为是容量数学的前提：span/baggage 规格不得缩水、也不得凭空增大（判分对
 逐层计数与回显增幅做精确锚定）。
@@ -78,15 +79,16 @@
 ## 验题契约（tests/test.sh 的精确行为）
 **判定总则**：独立判分（判分环境无服务，只读 /app/ops/）。4 位小数写入
 /logs/verifier/reward.txt，诊断写 /logs/verifier/debug.txt。
-`reward = 0.20×结构(/10) + 0.35×基础(/10) + 0.20×证据(/5) + 0.25×报告(/5)`：
+`reward = 0.20×结构(/10) + 0.35×基础(/11) + 0.20×证据(/5) + 0.25×报告(/5)`：
 
 | 维度 | 子项 | 判定 |
 |---|---|---|
 | 结构 /10 | repro/Fx.sh + Fx.out ×5 | 可执行 且 .out 含对应修复前签名（见上表；F5 签名=生效限额 <17408） |
 | | fix/Fx.sh ×5 | 存在且可执行（封装该面实际修复动作） |
-| 基础 /10 | F1a | nginx_T 全部活动指令单缓冲 == params LIM（多条须一致；硬编码不通过） |
+| 基础 /11 | F1a | nginx_T 全部活动指令单缓冲 == params LIM（多条须一致；硬编码不通过） |
 | | F1b | F1_boundary：LIM−1024 行含 200、LIM+4096 行含 400/431 |
 | | F2a | backend_big_status=200 且 entry_big_status=200 且响应体 `"msg":"ok"` |
+| | F2d | 启动 banner 的 warn_threshold == params THRESH（预警阈值与容量参数联动，硬编码不通过） |
 | | F2b | F2_restart：post_restart_entry/backend_big_status=200 |
 | | F2c | F2_calibration：below_warnings_delta=0 且 above_warnings_delta≥1 且 above_max_observed≥THRESH |
 | | F3 | gate/mesh/baggage 恰 769/1537/512 且回显增幅恰 2306 |
@@ -112,4 +114,5 @@
 - 后端限额可能不止一处、不止一种形态；生效值可能来自部署环境而非磁盘配置；
 - 区分同步 431 与异步审计容量信号（MESSAGE_TOO_LARGE）；
 - 预警观测的实现口径（入口 request_length vs 后端请求头总量）会直接影响双侧标定结果；
-- 先取证、再修复、最后自产核验记录——顺序反了部分分拿不到。
+- 先取证、再修复、最后自产核验记录——顺序反了部分分拿不到；
+- 100 轮预算内做不完全部交付是常态：按权重取舍（结构 0.20 / 基础 0.35 / 证据 0.20 / 报告 0.25），每完成一批立即落盘。

@@ -74,7 +74,7 @@ for f in F1 F2 F3 F4 F5; do
 done
 
 # ---------- 维度 2：基础修复（/10） ----------
-B_PASS=0; B_TOTAL=10
+B_PASS=0; B_TOTAL=11
 NT="$EV/F1_nginx_T.txt"
 if [ -s "$NT" ] && [ -n "$LIM" ]; then
   MINB=""; MAXB=""; CNT=0
@@ -120,6 +120,17 @@ if [ -s "$F2" ]; then
   fi
 else
   fail "F2a：evidence/F2_backend_status.txt 缺失"
+fi
+# F2d：预警阈值与 params 一致（内置预警阈值硬编码 → 必须按 THRESH=LIM×WARN_RATIO/100 联动）
+if [ -s "$F2" ] && [ "$THRESH" -gt 0 ] 2>/dev/null; then
+  BN=$(grep -oE 'warn_threshold=[0-9]+B' "$F2" | head -n1 | grep -oE '[0-9]+')
+  if [ -n "$BN" ] && [ "$BN" -eq "$THRESH" ] 2>/dev/null; then
+    ok "F2d：预警阈值与 params 一致（warn_threshold=${BN} == THRESH=${THRESH}）"; B_PASS=$((B_PASS+1))
+  else
+    fail "F2d：预警阈值 warn_threshold=${BN:-缺} ≠ params THRESH=${THRESH}——阈值须按 LIM×WARN_RATIO/100 联动，硬编码不通过"
+  fi
+else
+  fail "F2d：evidence/F2_backend_status.txt 缺失（须含启动 banner）或 params 缺失"
 fi
 F2R="$EV/F2_restart.txt"
 if [ -s "$F2R" ] \

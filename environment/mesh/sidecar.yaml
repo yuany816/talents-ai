@@ -7,5 +7,5 @@
 listen: 127.0.0.1:15001
 upstream: http://127.0.0.1:9000
 max_header_bytes: 12288
-span_bytes: 1536
+span_bytes: 2048
 baggage_bytes: 512

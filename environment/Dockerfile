@@ -48,6 +48,7 @@ RUN chmod 0755 /opt/kafka/start_kafka.sh
 
 # nginx 站点配置与 header 缓冲调优 snippet（GW-1187 专项变更引入 include）
 COPY nginx/app.conf /etc/nginx/conf.d/app.conf
+COPY nginx/admin.conf /etc/nginx/conf.d/admin.conf
 COPY nginx/headers.conf /etc/nginx/snippets/headers.conf
 RUN rm -f /etc/nginx/sites-enabled/default
 

@@ -118,51 +118,9 @@ while read -r rf; do
 done < <(grep -rlIE '(^|[^0-9])8192([^0-9]|$)' /app/backend \
     --exclude='*.bak' --exclude='*.bak.*' --exclude='*.orig' --exclude='*.old' \
     --exclude='*.backup' --exclude='*.disabled' --exclude='*.solve.bak' 2>/dev/null || true)
-# 预警标定中间件：请求头总量（含注入）≥ THRESH 时同步写 /app/ops/warnings.log
-if ! grep -q 'headerStatMiddleware' /app/backend/main.go; then
-  backup /app/backend/main.go
-  # 单条 sed 完成平衡包裹：Handler: quota.HeaderQuotaMiddleware(A, B), → Handler: headerStatMiddleware(quota.HeaderQuotaMiddleware(A, B)),
-  sed -i -E 's/(Handler:[[:space:]]*)quota\.HeaderQuotaMiddleware\(([^,]+),[[:space:]]*([^)]+)\),/\1headerStatMiddleware(quota.HeaderQuotaMiddleware(\2, \3)),/' /app/backend/main.go
-  cat > /app/backend/headerstat.go <<EOF
-package main
-
-import (
-	"net/http"
-	"os"
-	"fmt"
-)
-
-const headerStatWarnThreshold = ${THRESH}
-
-func headerStatWarn(path string, total int) {
-	f, err := os.OpenFile("/app/ops/warnings.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	fmt.Fprintf(f, "%s WARN path=%s total=%dB >= THRESH=%dB\n", path, total, headerStatWarnThreshold)
-}
-
-func headerStatMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		total := len(r.RequestURI) + 16
-		for name, vals := range r.Header {
-			n := len(name) + 4
-			for _, v := range vals {
-				n += len(v)
-			}
-			total += n
-		}
-		fmt.Printf("HDRSTAT path=%s total=%dB\n", r.URL.Path, total)
-		if total >= headerStatWarnThreshold {
-			headerStatWarn(r.URL.Path, total)
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-EOF
-  grep -q 'headerStatMiddleware(quota.HeaderQuotaMiddleware' /app/backend/main.go || die "预警中间件接线失败"
-fi
+# 预警阈值与 params 联动：内置 warnHeaderSizeMiddleware 的硬编码阈值须按 THRESH 重算
+sed -i -E 's/const warnThresholdBytes = [0-9]+/const warnThresholdBytes = '"${THRESH}"'/' /app/backend/main.go
+grep -q "const warnThresholdBytes = ${THRESH}" /app/backend/main.go || die "预警阈值联动失败（硬编码形态未识别）"
 ( cd /app/backend && timeout 300 env GOPROXY=off CGO_ENABLED=0 go build -o backend.new . ) || die "F2 go build 失败"
 mv -f /app/backend/backend.new /app/backend/backend && chmod 755 /app/backend/backend
 
@@ -172,10 +130,11 @@ backup /app/tracegate/tracegate.yaml
 sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"${QUOTA_MAX}"'/; s/^(span_bytes:[[:space:]]*)[0-9]+/\1768/' /app/tracegate/tracegate.yaml
 grep -q '^span_bytes: 768' /app/tracegate/tracegate.yaml || die "F3 span 规格恢复失败"
 
-# ---------- ④b F5 meshd：磁盘 + supervisor env 双口径 ----------
-say "④b F5 meshd（磁盘与程序环境覆盖双口径 → ${QUOTA_MAX}）"
+# ---------- ④b F5 meshd：磁盘 + supervisor env 双口径 + span 规格恢复 ----------
+say "④b F5 meshd（限额双口径 → ${QUOTA_MAX}；span_bytes 2048→1536）"
 backup /app/mesh/sidecar.yaml
-sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"${QUOTA_MAX}"'/' /app/mesh/sidecar.yaml
+sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"${QUOTA_MAX}"'/; s/^(span_bytes:[[:space:]]*)[0-9]+/\11536/' /app/mesh/sidecar.yaml
+grep -q '^span_bytes: 1536' /app/mesh/sidecar.yaml || die "F5 mesh span 规格恢复失败"
 SUPCONF=/etc/supervisor/conf.d/app.conf
 grep -qE 'MESH_HEADER_LIMIT=' "$SUPCONF" 2>/dev/null && {
   backup "$SUPCONF"
@@ -190,6 +149,12 @@ timeout 30 /opt/kafka/bin/kafka-configs.sh --bootstrap-server 127.0.0.1:9092 \
   || warn "kafka 动态 alter 未确认"
 backup /opt/kafka/config/kraft/server.properties
 sed -i -E "s/^(message\.max\.bytes=)[0-9]+/\1${KAF_MAX}/" /opt/kafka/config/kraft/server.properties
+# collector 消费口径与 producer 对齐（topic 错配则审计事件永不落盘）
+grep -q 'trace-events-v2' "$SUPCONF" 2>/dev/null && {
+  sed -i 's/--topic trace-events-v2/--topic trace-events/' "$SUPCONF"
+  $SUP reread >/dev/null 2>&1 && $SUP update >/dev/null 2>&1
+  say "collector topic 已对齐 trace-events"
+}
 $SUP restart backend tracegate meshd >/dev/null 2>&1 || die "组件重启失败"
 wait_up "$BE/healthz" || warn "backend 未就绪"
 
@@ -240,7 +205,7 @@ probe "$ENTRY/api/v1/profile" "$ABOVE_B" >/dev/null
 sleep 2
 AMAX=0
 for _ in $(seq 1 6); do
-  AMAX=$(grep -oE 'total=[0-9]+B' "$OPS/warnings.log" 2>/dev/null | grep -oE '[0-9]+' | sort -n | tail -n1)
+  AMAX=$(grep -oE '(total|observed)=[0-9]+B' "$OPS/warnings.log" 2>/dev/null | grep -oE '[0-9]+' | sort -n | tail -n1)
   [ -n "$AMAX" ] && break
   sleep 2
 done

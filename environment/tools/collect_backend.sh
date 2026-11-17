@@ -14,5 +14,6 @@ printf 'X-Verify-Token: %s\n' "$(head -c 16384 /dev/zero | tr '\0' 'x')" > "$H"
   echo "server_header=$(curl -s -D - -o /dev/null --max-time 15 "$ENTRY/api/v1/profile" | grep -i '^server:' | head -n1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/\r$//')"
   echo "profile_body=$(curl -s --max-time 15 "$BE/api/v1/profile" | head -n1)"
   echo "healthz_body=$(curl -s --max-time 15 -H "@$H" "$ENTRY/healthz" | tr -d '[:space:]')"
+  echo "startup_banner=$(grep 'startup:' /var/log/backend.log 2>/dev/null | tail -n1)"
 } > /app/ops/evidence/F2_backend_status.txt
 cat /app/ops/evidence/F2_backend_status.txt
