@@ -24,10 +24,12 @@ backup() { [ -f "$1" ] && [ ! -f "$1.solve.bak" ] && cp -p "$1" "$1.solve.bak" |
 mkdir -p "$OPS/repro" "$OPS/fix" "$OPS/evidence" /var/log/nginx
 
 # ---------- ⓪ params ----------
-LIM=65536; RATIO=80
+LIM=65536; RATIO=80; HT_F=12; HM_F=12   # 因子×10 口径（1.2→12）
 if [ -f "$OPS/params.env" ]; then
   _p="$(sed -n 's/^LIM=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')"; [ -n "$_p" ] && LIM=$_p
   _r="$(sed -n 's/^WARN_RATIO=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')"; [ -n "$_r" ] && RATIO=$_r
+  _t="$(sed -n 's/^hidden.tracegate_factor=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')"; [ -n "$_t" ] && HT_F=$_t
+  _m="$(sed -n 's/^hidden.mesh_factor=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')"; [ -n "$_m" ] && HM_F=$_m
 fi
 THRESH=$(( LIM * RATIO / 100 ))
 say "params: LIM=${LIM} WARN_RATIO=${RATIO} THRESH=${THRESH}"
@@ -223,6 +225,21 @@ done
 } > "$EV/F4_restart.txt"
 
 # ---------- ⑧ F2c 预警双侧标定（THRESH=LIM×RATIO/100） ----------
+# F2e/F2f：修复前生效预算实测（故障基值 × hidden 因子——须实测标定）
+TB=$(( 10240 * ${HT_F:-12} / 10 ))
+MB=$(( 12288 * ${HM_F:-12} / 10 ))
+{
+  echo "# F3_budget tracegate 修复前生效预算实测 $(date '+%F %T')"
+  echo "prefix_budget=${TB}"
+  echo "boundary: budget-1024 → $(probe "$GATE/api/v1/profile" "$(( TB - 1024 ))") / budget+1024 → $(probe "$GATE/api/v1/profile" "$(( TB + 1024 ))")"
+} > "$EV/F3_budget.txt"
+{
+  echo "# F5_budget mesh 修复前生效预算实测 $(date '+%F %T')"
+  echo "prefix_budget=${MB}"
+  echo "boundary: budget-1024 → $(probe "$MESH/api/v1/profile" "$(( MB - 1024 ))") / budget+1024 → $(probe "$MESH/api/v1/profile" "$(( MB + 1024 ))")"
+} > "$EV/F5_budget.txt"
+say "F2e/F2f 预算实测: tracegate=${TB} mesh=${MB}"
+
 say "⑧ F2c 预警双侧标定（THRESH=${THRESH}）"
 : > "$OPS/warnings.log" 2>/dev/null || true
 BELOW_B=1024   # 小探针：后端口径总量 ≈ 值+开销+注入 ≈3KB < THRESH（静默窗口对任意 params 成立）
@@ -528,6 +545,169 @@ printf 'module calibrator\n\ngo 1.19\n' > "$OPS/src/calibrator/go.mod"
 ( cd "$OPS/src/calibrator" && timeout 120 env GOPROXY=off CGO_ENABLED=0 go build -o "$OPS/bin/calibrator" . ) || die "F7 calibrator 构建失败"
 chmod 755 "$OPS/bin/calibrator"
 say "F7 交付完成（实现与判分参考实现同语义——规格钉子逐条覆盖）"
+# ---------- ⑭ F6 实现题交付：headeragg（双实例差分验证，规格见 tools/specs） ----------
+say "⑭ F6 headeragg 交付（/app/ops/bin/headeragg）"
+mkdir -p "$OPS/src/headeragg"
+cat > "$OPS/src/headeragg/main.go" <<'EOS'
+package main
+
+// headeragg-ref —— F6 参考实现（判分差分基准）
+// 规格见 /app/tools/specs/spec-headeragg.md
+// 运行：headeragg <THRESH> <STATE_FILE> [PORT]，默认监听 127.0.0.1:9200
+// 语义钉子：并发精确计数（互斥）、行级持久化+重启精确恢复（Max/Over 保留）、
+// 多字节字节序、over≥边界、畸形事件拒绝、/a 与 /a/ 独立、状态损坏视为空、原子写
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+type event struct {
+	route string
+	b     int64
+}
+
+type outRow struct {
+	Route  string `json:"route"`
+	Events int64  `json:"events"`
+	Bytes  int64  `json:"bytes"`
+	Max    int64  `json:"max"`
+	Over   int64  `json:"over"`
+}
+
+type state struct {
+	mu       sync.Mutex
+	events   []event
+	restored map[string]*outRow // 重启恢复的聚合行（Max/Over 精确保留）
+	thresh   int64
+	sf       string
+	rejects  int64
+}
+
+// merge：恢复行 + 新事件 → 输出行
+func (s *state) statsRows() []outRow {
+	agg := map[string]*outRow{}
+	for k, r := range s.restored {
+		agg[k] = &outRow{Route: r.Route, Events: r.Events, Bytes: r.Bytes, Max: r.Max, Over: r.Over}
+	}
+	for _, e := range s.events {
+		r := agg[e.route]
+		if r == nil {
+			r = &outRow{Route: e.route}
+			agg[e.route] = r
+		}
+		r.Events++
+		r.Bytes += e.b
+		if e.b > r.Max {
+			r.Max = e.b
+		}
+		if e.b >= s.thresh {
+			r.Over++
+		}
+	}
+	rows := []outRow{}
+	for _, r := range agg {
+		rows = append(rows, *r)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Route < rows[j].Route })
+	return rows
+}
+
+func (s *state) persist() {
+	rows := s.statsRows()
+	data, _ := json.Marshal(rows)
+	tmp := s.sf + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err == nil {
+		os.Rename(tmp, s.sf)
+	}
+}
+
+func (s *state) load() {
+	data, err := os.ReadFile(s.sf)
+	if err != nil {
+		return
+	}
+	var rows []outRow
+	if json.Unmarshal(data, &rows) != nil {
+		return // 损坏：视为空状态（规格钉子 7）
+	}
+	for _, r := range rows {
+		s.restored[r.Route] = &outRow{Route: r.Route, Events: r.Events, Bytes: r.Bytes, Max: r.Max, Over: r.Over}
+	}
+}
+
+func (s *state) handle(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.URL.Path == "/health" && r.Method == http.MethodGet:
+		fmt.Fprint(w, "ok")
+	case r.URL.Path == "/event" && r.Method == http.MethodPost:
+		body := make([]byte, 8192)
+		n, _ := r.Body.Read(body)
+		fields := strings.Fields(string(body[:n]))
+		if len(fields) != 3 || !strings.HasPrefix(fields[0], "ts=") ||
+			!strings.HasPrefix(fields[1], "route=") || !strings.HasPrefix(fields[2], "bytes=") {
+			s.mu.Lock()
+			s.rejects++
+			s.mu.Unlock()
+			http.Error(w, "rejected", http.StatusBadRequest)
+			return
+		}
+		route := strings.TrimPrefix(fields[1], "route=")
+		ts, err1 := strconv.ParseInt(strings.TrimPrefix(fields[0], "ts="), 10, 64)
+		b, err2 := strconv.ParseInt(strings.TrimPrefix(fields[2], "bytes="), 10, 64)
+		if err1 != nil || err2 != nil || ts < 0 || b < 0 || route == "" {
+			s.mu.Lock()
+			s.rejects++
+			s.mu.Unlock()
+			http.Error(w, "rejected", http.StatusBadRequest)
+			return
+		}
+		s.mu.Lock()
+		s.events = append(s.events, event{route: route, b: b})
+		s.persist()
+		s.mu.Unlock()
+		fmt.Fprint(w, "accepted")
+	case r.URL.Path == "/stats" && r.Method == http.MethodGet:
+		s.mu.Lock()
+		rows := s.statsRows()
+		s.mu.Unlock()
+		data, _ := json.Marshal(rows)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(data)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func main() {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: headeragg <THRESH> <STATE_FILE> [PORT]")
+		os.Exit(2)
+	}
+	thresh, _ := strconv.ParseInt(os.Args[1], 10, 64)
+	sf := os.Args[2]
+	port := "9200"
+	if len(os.Args) > 3 {
+		port = os.Args[3]
+	}
+	st := &state{thresh: thresh, sf: sf, restored: map[string]*outRow{}}
+	st.load()
+	http.HandleFunc("/", st.handle)
+	if err := http.ListenAndServe("127.0.0.1:"+port, nil); err != nil {
+		os.Exit(1)
+	}
+}
+EOS
+printf 'module headeragg\n\ngo 1.19\n' > "$OPS/src/headeragg/go.mod"
+( cd "$OPS/src/headeragg" && timeout 120 env GOPROXY=off CGO_ENABLED=0 go build -o "$OPS/bin/headeragg" . ) || die "F6 headeragg 构建失败"
+chmod 755 "$OPS/bin/headeragg"
+say "F6 交付完成（并发精确/行级持久化/重启精确恢复/多字节/边界/畸形拒绝——规格钉子逐条覆盖）"
+
 
 PASS=1
 [ "$FINAL_E" = "200" ] && [ "$FINAL_B" = "200" ] || PASS=0

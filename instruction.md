@@ -79,7 +79,20 @@
 ## 验题契约（tests/test.sh 的精确行为）
 **判定总则**：独立判分（判分环境无服务，只读 /app/ops/）。4 位小数写入
 /logs/verifier/reward.txt，诊断写 /logs/verifier/debug.txt。
-`reward = 0.15×P1(运维修复清单) + 0.85×F7(实现题隐性套件)`：
+`reward = min(P1, F6, F7)`——**三维短板定标**：任一维度最低分即总分（木桶原理）。
+- P1(运维修复清单) = 0.20×结构(/10) + 0.35×基础(/11) + 0.20×证据(/5) + 0.25×报告(/5)；
+- F6(headeragg 实现题) = 隐性差分套件 12 场景通过比例；
+- F7(calibrator 实现题) = 隐性对抗套件 12 场景通过比例。
+
+## F6 实现题：headeragg（权重同 F7 · 双实例差分验证）
+
+交付：`/app/ops/bin/headeragg`（静态可执行 HTTP 服务，监听 127.0.0.1:9200）+ 源码
+`/app/ops/src/headeragg/`。运行：`headeragg <THRESH> <STATE_FILE>`。
+规格：`/app/tools/specs/spec-headeragg.md`（**语义钉子逐条实现**）。
+判分：判分环境启动交付二进制与参考实现各一实例，**同一请求序列双实例差分**——
+12 场景（100 并发精确计数、kill -9 重启精确恢复、多字节路由字节序、bytes 恰等
+THRESH 计 over、畸形事件拒绝、/a 与 /a/ 独立、状态损坏视为空、衔接累计）逐字段
+对照 /stats——任一字段不一致该场景即失败。**短板定标：F6 首试通过率即总分上限。**
 P1 = 0.20×结构(/10) + 0.35×基础(/11) + 0.20×证据(/5) + 0.25×报告(/5)。
 
 ## F7 实现题：calibrator（权重 0.85 · 隐性对抗验证）
@@ -96,7 +109,7 @@ invalid 桶、skipped 计数）逐字节对照参考实现——**场景每 tria
 |---|---|---|
 | 结构 /10 | repro/Fx.sh + Fx.out ×5 | 可执行 且 .out 含对应修复前签名（见上表；F5 签名=生效限额 <17408） |
 | | fix/Fx.sh ×5 | 存在且可执行（封装该面实际修复动作） |
-| 基础 /11 | F1a | nginx_T 全部活动指令单缓冲 == params LIM（多条须一致；硬编码不通过） |
+| 基础 /13 | F1a | nginx_T 全部活动指令单缓冲 == params LIM（多条须一致；硬编码不通过） |
 | | F1b | F1_boundary：LIM−1024 行含 200、LIM+4096 行含 400/431 |
 | | F2a | backend_big_status=200 且 entry_big_status=200 且响应体 `"msg":"ok"` |
 | | F2d | 启动 banner 的 warn_threshold == params THRESH（预警阈值与容量参数联动，硬编码不通过） |
@@ -107,6 +120,8 @@ invalid 桶、skipped 计数）逐字节对照参考实现——**场景每 tria
 | | F4b | F4_restart：含 marker= 且 event_seen=ok |
 | | F5a | F5_meshd_status：effective_limit ≥ 17408 |
 | | F5b | F5_restart：effective_limit ≥ 17408（restart all 后仍生效） |
+| | F2e | F3_budget：prefix_budget == 故障基值 10240 × hidden 因子（修复前生效预算实测，边界探针记录须在场） |
+| | F2f | F5_budget：prefix_budget == 故障基值 12288 × hidden 因子（mesh 修复前生效预算实测） |
 | 证据 /5 | F1~F5 | evidence/ 下各有至少一个 `Fx_*` 文件 |
 | 报告 /5 | 逐面引用 | 报告逐面引用 evidence/Fx_* 证据文件相对路径（F1~F5 各计 1 项） |
 

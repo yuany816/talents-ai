@@ -94,7 +94,7 @@ func budgetFromParams(yamlBudget int) int {
 		}
 	}
 	if lim > 0 && fac > 0 {
-		return int(float64(lim) * fac)
+		return int(float64(yamlBudget) * fac) // 生效预算 = 故障基值 × hidden 因子（保留故障，随机化生效值）
 	}
 	return yamlBudget
 }

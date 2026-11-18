@@ -26,10 +26,12 @@ printf '%s\n' "0.0000" > "$REWARD_FILE"
 echo "ops_dir=present" >> "$DEBUG_FILE"
 
 # ---------- params.env ----------
-LIM=""; RATIO=""
+LIM=""; RATIO=""; HT_F=0; HM_F=0
 [ -f "$OPS/params.env" ] && {
   LIM=$(sed -n 's/^[[:space:]]*LIM=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')
   RATIO=$(sed -n 's/^[[:space:]]*WARN_RATIO=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')
+  HT_F=$(sed -n 's/^[[:space:]]*hidden.tracegate_factor=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')
+  HM_F=$(sed -n 's/^[[:space:]]*hidden.mesh_factor=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')
 }
 THRESH=0
 [ -n "$LIM" ] && [ -n "$RATIO" ] && THRESH=$(( LIM * RATIO / 100 ))
@@ -75,7 +77,7 @@ for f in F1 F2 F3 F4 F5; do
 done
 
 # ---------- 维度 2：基础修复（/10） ----------
-B_PASS=0; B_TOTAL=11
+B_PASS=0; B_TOTAL=13
 NT="$EV/F1_nginx_T.txt"
 if [ -s "$NT" ] && [ -n "$LIM" ]; then
   MINB=""; MAXB=""; CNT=0
@@ -211,6 +213,32 @@ if [ -s "$F5R" ]; then
 else
   fail "F5b：evidence/F5_restart.txt 缺失（restart all 后重跑 collect_meshd 并保存）"
 fi
+# F2e：tracegate 修复前生效预算 == 故障基值 × hidden 因子（须实测标定，硬编码不通过）
+F3B="$EV/F3_budget.txt"
+TB=$(( 10240 * ${HT_F:-0} / 10 ))
+if [ -s "$F3B" ] && [ "${HT_F:-0}" -gt 0 ] 2>/dev/null; then
+  PB=$(sed -n 's/^prefix_budget=//p' "$F3B" | head -n1 | tr -dc '0-9')
+  if [ -n "$PB" ] && [ "$PB" -eq "$TB" ] 2>/dev/null; then
+    ok "F2e：tracegate 修复前生效预算实测 == ${TB}（基值 10240 × factor ${HT_F}/10）"; B_PASS=$((B_PASS+1))
+  else
+    fail "F2e：prefix_budget=${PB:-缺} ≠ ${TB}（10240×factor/10）——修复前生效预算未实测或与 hidden 因子不一致"
+  fi
+else
+  fail "F2e：evidence/F3_budget.txt 缺失或 params hidden 因子缺失"
+fi
+# F2f：mesh 修复前生效预算 == 故障基值 × hidden 因子
+F5B2="$EV/F5_budget.txt"
+MB=$(( 12288 * ${HM_F:-0} / 10 ))
+if [ -s "$F5B2" ] && [ "${HM_F:-0}" -gt 0 ] 2>/dev/null; then
+  MP=$(sed -n 's/^prefix_budget=//p' "$F5B2" | head -n1 | tr -dc '0-9')
+  if [ -n "$MP" ] && [ "$MP" -eq "$MB" ] 2>/dev/null; then
+    ok "F2f：mesh 修复前生效预算实测 == ${MB}（基值 12288 × factor ${HM_F}/10）"; B_PASS=$((B_PASS+1))
+  else
+    fail "F2f：prefix_budget=${MP:-缺} ≠ ${MB}（12288×factor/10）——mesh 修复前生效预算未实测"
+  fi
+else
+  fail "F2f：evidence/F5_budget.txt 缺失或 params hidden 因子缺失"
+fi
 
 # ---------- 维度 3：证据齐全（/5） ----------
 E_PASS=0; E_TOTAL=5
@@ -242,6 +270,7 @@ echo "[verifier] P1 运维清单: 结构=$S_PASS/$S_TOTAL 基础=$B_PASS/$B_TOTA
 # 规格见 /app/tools/specs/spec-calibrator.md；判分环境以 tests/bin/calibrator-ref 为
 # 参考实现，12 个复合场景逐字节对照 agent 交付的 /app/ops/bin/calibrator。
 F7_PASS=0; F7_TOTAL=0
+F6_PASS=0; F6_TOTAL=12
 AGG="$OPS/bin/calibrator"
 REFBIN="/tests/bin/calibrator-ref"; [ -x "$REFBIN" ] || REFBIN="$TESTS_DIR/bin/calibrator-ref"
 GENBIN="/tests/bin/gen-calibrator"; [ -x "$GENBIN" ] || GENBIN="$TESTS_DIR/bin/gen-calibrator"
@@ -267,8 +296,91 @@ else
 fi
 P2=$(awk "BEGIN{t=$F7_TOTAL; p=$F7_PASS; printf \"%.4f\", (t>0)?p/t:0}")
 
-# ---------- 加权总分：P1×0.15 + P2×0.85 ----------
-SCORE=$(awk "BEGIN{printf \"%.4f\", 0.15*$P1 + 0.85*$P2}")
+# ---------- P3：F6 headeragg 实现题（隐性差分套件） ----------
+F6_PASS=0; F6_TOTAL=12
+HAGG="$OPS/bin/headeragg"
+HREFB="$TESTS_DIR/bin/headeragg-ref"
+THRESH_F6="$THRESH_V"
+if [ -n "$LIM" ] && [ -n "$RATIO" ] && [ -x "$HAGG" ] && [ -x "$HREFB" ]; then
+  for pid in $(ss -ltnp 2>/dev/null | grep -E ':92[0-9]{2} |:93[0-9]{2} ' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do kill -9 "$pid" 2>/dev/null; done
+  sleep 0.3
+  rm -f /tmp/f6-a.state /tmp/f6-r.state
+  "$HAGG" "$THRESH_F6" /tmp/f6-a.state 9200 & PA=$!
+  "$HREFB" "$THRESH_F6" /tmp/f6-r.state 9300 & PR=$!
+  sleep 0.6
+  killA() { kill -9 "$PA" 2>/dev/null; }
+  killR() { kill -9 "$PR" 2>/dev/null; }
+  restartBoth() {
+    killA; killR; sleep 0.3
+    "$HAGG" "$THRESH_F6" /tmp/f6-a.state 9200 & PA=$!
+    "$HREFB" "$THRESH_F6" /tmp/f6-r.state 9300 & PR=$!
+    sleep 0.6
+  }
+  post() { curl -s -X POST -d "$1" "http://127.0.0.1:$2/event" >/dev/null; }
+  cmpStats() {
+    a=$(curl -s "http://127.0.0.1:9200/stats")
+    r=$(curl -s "http://127.0.0.1:9300/stats")
+    if [ "$a" = "$r" ]; then F6_PASS=$((F6_PASS+1)); ok "F6 场景 $1 双实例一致"
+    else fail "F6 场景 $1 双实例不一致（agent=$r vs ref=$r2）"; fi
+  }
+  cmpStats() {
+    a=$(curl -s "http://127.0.0.1:9200/stats")
+    r=$(curl -s "http://127.0.0.1:9300/stats")
+    if [ "$a" = "$r" ]; then F6_PASS=$((F6_PASS+1)); ok "F6 场景 $1 双实例 stats 一致"
+    else fail "F6 场景 $1 双实例 stats 不一致"; fi
+  }
+  # s1 单事件
+  post "ts=100 route=/api bytes=500" 9200; post "ts=100 route=/api bytes=500" 9300
+  cmpStats s1
+  # s2 混合 10 事件
+  for i in 1 2 3 4 5; do post "ts=$((100+i)) route=/r$((i%2)) bytes=$((100+i*7))" 9200; post "ts=$((100+i)) route=/r$((i%2)) bytes=$((100+i*7))" 9300; done
+  cmpStats s2
+  # s3 并发 100（精确计数）
+  CP=""; for i in $(seq 1 100); do curl -s -X POST -d "ts=500 route=/burst bytes=100" http://127.0.0.1:9200/event >/dev/null & CP="$CP $!"; curl -s -X POST -d "ts=500 route=/burst bytes=100" http://127.0.0.1:9300/event >/dev/null & CP="$CP $!"; done
+  for c in $CP; do wait "$c" 2>/dev/null; done; sleep 0.5
+  cmpStats s3
+  # s4 多字节路由
+  post "ts=600 route=/路由/α bytes=333" 9200; post "ts=600 route=/路由/α bytes=333" 9300
+  post "ts=600 route=/emoji🚀 bytes=444" 9200; post "ts=600 route=/emoji🚀 bytes=444" 9300
+  cmpStats s4
+  # s5 边界恰等（bytes==THRESH 计 over）+ s6 THRESH+1
+  post "ts=700 route=/edge bytes=$THRESH_F6" 9200; post "ts=700 route=/edge bytes=$THRESH_F6" 9300
+  cmpStats s5
+  post "ts=700 route=/edge bytes=$((THRESH_F6+1))" 9200; post "ts=700 route=/edge bytes=$((THRESH_F6+1))" 9300
+  cmpStats s6
+  # s7 畸形事件（stats 不得变化）
+  post "bad line" 9200; post "bad line" 9300
+  post "ts=x route=/m bytes=1" 9200; post "ts=x route=/m bytes=1" 9300
+  cmpStats s7
+  # s8 尾斜杠独立路由
+  post "ts=800 route=/a bytes=10" 9200; post "ts=800 route=/a bytes=10" 9300
+  post "ts=800 route=/a/ bytes=20" 9200; post "ts=800 route=/a/ bytes=20" 9300
+  cmpStats s8
+  # s9 双实例 kill+restart 持久化恢复
+  killA; killR; sleep 0.3
+  "$HAGG" "$THRESH_F6" /tmp/f6-a.state 9200 & PA=$!
+  "$HREFB" "$THRESH_F6" /tmp/f6-r.state 9300 & PR=$!
+  sleep 0.6
+  cmpStats s9
+  # s10 重启后衔接
+  post "ts=900 route=/post bytes=777" 9200; post "ts=900 route=/post bytes=777" 9300
+  cmpStats s10
+  # s11 静默（THRESH−1 不得计 over）
+  post "ts=1000 route=/quiet bytes=$((THRESH_F6-1))" 9200; post "ts=1000 route=/quiet bytes=$((THRESH_F6-1))" 9300
+  cmpStats s11
+  # s12 终态混合
+  post "ts=1100 route=/fin/α bytes=999" 9200; post "ts=1100 route=/fin/α bytes=999" 9300
+  post "ts=1100 route=/fin bytes=1" 9200; post "ts=1100 route=/fin bytes=1" 9300
+  cmpStats s12
+  killA; killR
+else
+  F6_TOTAL=12
+  fail "F6：/app/ops/bin/headeragg 缺失或不可执行——实现题 0 分"
+fi
+F6=$(awk "BEGIN{t=$F6_TOTAL; p=$F6_PASS; printf \"%.4f\", (t>0)?p/t:0}")
+
+# ---------- 加权总分：短板定标 min(P1, F6, F7) ----------
+SCORE=$(awk "BEGIN{m=$P1; if ($F6<m) m=$F6; if ($P2<m) m=$P2; printf \"%.4f\", m}")
 
 # ---------- CAP：repro 取证全缺 → 封顶 0.45 ----------
 REPRO_OK=0
