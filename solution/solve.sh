@@ -195,6 +195,16 @@ MB_D="$(printf '%s' "$MB_LINE" | sed -nE 's/.*trace_in=([0-9]+)B trace_out=([0-9
   echo "prefix_multibyte_delta=${MB_D:-0}"
   echo "prefix_ascii_delta=${MA_D:-0}"
 } > "$RP/F9.out"
+# F3/F5 的 span 取证与 meshd 生效口径取证（与 F9.out 同批，修复前状态）
+{
+  echo "# F3 取证（预算修复后、rune 压缩修复前）$(date '+%F %T')"
+  echo "gate_delta=${MA_D:-0}"
+  echo "mesh_delta=${MB_D:-0}"
+  echo "gatestat_raw=${MA_LINE}"
+  echo "meshstat_raw=${MB_LINE}"
+} > "$RP/F3.out"
+bash "$TOOLS/collect_meshd.sh" > "$RP/F5.out" 2>&1 || warn "F5 取证采集失败"
+for f in F1 F2 F3 F4 F5 F8 F9; do [ -s "$RP/$f.out" ] || die "取证 $f.out 失败"; done
 say "F9 差分取证: ascii=${MA_D:-0} multibyte=${MB_D:-0}（若两者不同即 rune 口径偏移证据）"
 # ④b-3 F9 代码修复（appendSpan 偏移 + baggage 符号 + 多字节 rune 口径压缩移除）+ 重编译 + 重启
 backup /app/mesh/main.go
