@@ -78,7 +78,7 @@ for f in F1 F2 F3 F4 F5; do
 done
 
 # ---------- 维度 2：基础修复（/10） ----------
-B_PASS=0; B_TOTAL=15
+B_PASS=0; B_TOTAL=16
 NT="$EV/F1_nginx_T.txt"
 if [ -s "$NT" ] && [ -n "$LIM" ]; then
   MINB=""; MAXB=""; CNT=0
@@ -246,6 +246,27 @@ if [ -s "$F9F" ]; then
 else
   fail "F9：evidence/F9_offset.txt 缺失（差分实验：ASCII vs 多字节路由的逐跳 delta 对照）"
 fi
+# F2g：门禁脚本行为（判分环境本地伪造日志——干净过/注入拒，恢复 v3.1 覆盖回归）
+GATEB="$OPS/quality_gate.sh"
+if [ -x "$GATEB" ]; then
+  mkdir -p /var/log/nginx
+  : > /var/log/nginx/access.log; : > /var/log/nginx/hdrsize.log; : > /var/log/nginx/error.log
+  G1=0; bash "$GATEB" >/dev/null 2>&1 || G1=1
+  echo '127.0.0.1 - - ['"$(date '+%d/%b/%Y:%H:%M:%S +0000')"'] "GET /injected HTTP/1.1" 431 0 "-" "verifier"' >> /var/log/nginx/access.log
+  G2=0; bash "$GATEB" >/dev/null 2>&1 || G2=1
+  : > /var/log/nginx/access.log
+  echo "$(date +%s).000 431 99999 \"GET /injected HTTP/1.1\"" >> /var/log/nginx/hdrsize.log
+  G3=0; bash "$GATEB" >/dev/null 2>&1 || G3=1
+  : > /var/log/nginx/hdrsize.log
+  if [ "$G1" = "0" ] && [ "$G2" = "1" ] && [ "$G3" = "1" ]; then
+    ok "F2g：门禁行为（干净过/431 注入拒）"; B_PASS=$((B_PASS+1))
+  else
+    fail "F2g：门禁行为异常（clean=$G1 inject_access=$G2 inject_hdrsize=$G3——须 clean=0/inject≠0）"
+  fi
+  : > /var/log/nginx/access.log; : > /var/log/nginx/hdrsize.log; : > /var/log/nginx/error.log
+else
+  fail "F2g：quality_gate.sh 缺失或不可执行——门禁行为 0 分"
+fi
 # F2e：tracegate 修复前生效预算 == 故障基值 × hidden 因子（须实测标定，硬编码不通过）
 F3B="$EV/F3_budget.txt"
 TB=$(( 10240 * ${HT_F:-0} / 10 ))
@@ -369,8 +390,9 @@ if [ -n "$LIM" ] && [ -n "$RATIO" ] && [ -x "$HAGG" ] && [ -x "$HREFB" ]; then
   for i in 1 2 3 4 5; do post "ts=$((100+i)) route=/r$((i%2)) bytes=$((100+i*7))" 9200; post "ts=$((100+i)) route=/r$((i%2)) bytes=$((100+i*7))" 9300; done
   cmpStats s2
   # s3 并发 100（精确计数）
-  CP=""; for i in $(seq 1 100); do curl -s -X POST -d "ts=500 route=/burst bytes=100" http://127.0.0.1:9200/event >/dev/null & CP="$CP $!"; curl -s -X POST -d "ts=500 route=/burst bytes=100" http://127.0.0.1:9300/event >/dev/null & CP="$CP $!"; done
-  for c in $CP; do wait "$c" 2>/dev/null; done; sleep 0.5
+  seq 1 100 | xargs -P 20 -I{} curl -s -X POST -d "ts=500 route=/burst bytes=100" http://127.0.0.1:9200/event >/dev/null
+  seq 1 100 | xargs -P 20 -I{} curl -s -X POST -d "ts=500 route=/burst bytes=100" http://127.0.0.1:9300/event >/dev/null
+  sleep 0.5
   cmpStats s3
   # s4 多字节路由
   post "ts=600 route=/路由/α bytes=333" 9200; post "ts=600 route=/路由/α bytes=333" 9300
