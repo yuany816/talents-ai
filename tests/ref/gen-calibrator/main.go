@@ -24,6 +24,15 @@ var seed uint64
 
 func sp(s string) *string { return &s }
 
+func jit(n int) int64 { return int64(rnd(n)) }
+
+func rpick(i int) string {
+	pool := []string{"/api", "/svc", "/gw", "/edge", "/路由", "/api/v1", "/svc/", "/节点"}
+	return pool[(i+rnd(len(pool)))%len(pool)]
+}
+
+func vfill(n int) string { return strings.Repeat("x", n+rnd(5)) }
+
 func rnd(n int) int {
 	seed = seed*6364136223846793005 + 1442695040888963407
 	return int((seed >> 33) % uint64(n))
@@ -109,14 +118,14 @@ func main() {
 
 	// sc01：合并 SUM × 多字节 × 精确边界 × 垃圾行 —— 任一规则偏差即失败
 	// 精确边界推导：合并后总和 = 兄弟事件 canonical 之和 + pad 事件 canonical —— pad 尺寸须扣除兄弟
-	e1 := measureViaRef(mkev(1000, "/路由/α", map[string][]*string{"中文头": {sp("值")}}))
-	e2 := measureViaRef(mkev(1000, "/路由/α", map[string][]*string{"中文头": {sp("二")}}))
-	e3 := measureViaRef(mkev(2000, "/路由/β", map[string][]*string{"X": {sp("y")}}))
+	e1 := measureViaRef(mkev(1000, rpick(1)+"/α", map[string][]*string{"中文头": {sp(vfill(2))}}))
+	e2 := measureViaRef(mkev(1000, rpick(1)+"/α", map[string][]*string{"中文头": {sp(vfill(3))}}))
+	e3 := measureViaRef(mkev(2000, rpick(2)+"/β", map[string][]*string{"X": {sp(vfill(4))}}))
 	sc01 := []string{
-		mkev(1000, "/路由/α", map[string][]*string{"中文头": {sp("值")}}),
-		mkev(1000, "/路由/α", map[string][]*string{"中文头": {sp("二")}}),
+		mkev(1000, rpick(1)+"/α", map[string][]*string{"中文头": {sp(vfill(2))}}),
+		mkev(1000, rpick(1)+"/α", map[string][]*string{"中文头": {sp(vfill(3))}}),
 		padTo(1000, "/路由/α", "X-Pad", thresh-e1-e2),                 // 合并后总和恰 == THRESH → over≥1
-		mkev(2000, "/路由/β", map[string][]*string{"X": {sp("y")}}),
+		mkev(2000, rpick(2)+"/β", map[string][]*string{"X": {sp(vfill(4))}}),
 		padTo(2000, "/路由/β", "X-Pad", thresh+1-e3),                  // 恰 THRESH+1 → OVER
 		"", "# comment", "not-json {{{",                              // skipped×3
 	}
@@ -124,11 +133,11 @@ func main() {
 
 	// sc02：字节序排序（UTF-8 大码点在小写 ASCII 之后）× 大小写敏感 × 合并
 	sc02 := []string{
-		mkev(100, "/zzz", map[string][]*string{"A": {sp("1")}}),
-		mkev(100, "/路由", map[string][]*string{"A": {sp("2")}}),
-		mkev(100, "/AAA", map[string][]*string{"A": {sp("3")}}),
-		mkev(100, "/zzz", map[string][]*string{"A": {sp("4")}}),
-		mkev(200, "/aaa", map[string][]*string{"A": {sp("5")}}),
+		mkev(100+jit(9), rpick(3), map[string][]*string{"A": {sp("1")}}),
+		mkev(100+jit(9), "/路由", map[string][]*string{"A": {sp("2")}}),
+		mkev(100+jit(9), rpick(4), map[string][]*string{"A": {sp("3")}}),
+		mkev(100+jit(9), rpick(3), map[string][]*string{"A": {sp("4")}}),
+		mkev(200+jit(9), "/aaa", map[string][]*string{"A": {sp("5")}}),
 	}
 	writeStream(dir, 2, sc02)
 
