@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type meshConfig struct {
@@ -192,7 +193,12 @@ func main() {
 
 		// 2) mesh 注入：mesh span 追加 + X-Mesh-Baggage（恰 baggage_bytes 字符）
 		tc := r.Header.Get("X-Trace-Context")
-		grown := appendSpan(tc, "mesh", cfg.SpanBytes)
+		// 注入尺寸口径：路由含多字节字符时按 rune 口径压缩填充（与网关对齐的历史口径）
+		effSize := cfg.SpanBytes
+		if d := len(r.URL.Path) - utf8.RuneCountInString(r.URL.Path); d > 0 {
+			effSize = cfg.SpanBytes - d%8
+		}
+		grown := appendSpan(tc, "mesh", effSize)
 		r.Header.Set("X-Trace-Context", grown)
 		var bg string
 		if cfg.BaggageBytes == 0 {

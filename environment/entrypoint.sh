@@ -5,12 +5,14 @@ LIM=$(( 17408 + RANDOM % 48128 ))    # 17408..65535：恒放行 16384B 探针，
 RATIO=$(( 50 + RANDOM % 41 ))        # 50..90：预警阈值百分比
 HF_T=1.$(( 2 + RANDOM % 3 ))         # hidden.tracegate_factor：1.2/1.3/1.4（生效预算=LIM×factor，须实测标定）
 HF_M=1.$(( 2 + RANDOM % 3 ))         # hidden.mesh_factor：同上
+DP=$(( 3 + RANDOM % 5 ))             # hidden.drop_period：3..7（审计采样丢弃周期，须行为观测推断）
 mkdir -p /app/ops/repro /app/ops/fix /app/ops/evidence
 cat > /app/ops/params.env <<EOF
 LIM=${LIM}
 WARN_RATIO=${RATIO}
 hidden.tracegate_factor=${HF_T}
 hidden.mesh_factor=${HF_M}
+hidden.drop_period=${DP}
 EOF
 chmod 644 /app/ops/params.env
 echo "[entrypoint] params.env: LIM=${LIM} WARN_RATIO=${RATIO} hidden_tracegate_factor=${HF_T} hidden_mesh_factor=${HF_M}"

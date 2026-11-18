@@ -32,6 +32,7 @@ LIM=""; RATIO=""; HT_F=0; HM_F=0
   RATIO=$(sed -n 's/^[[:space:]]*WARN_RATIO=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')
   HT_F=$(sed -n 's/^[[:space:]]*hidden.tracegate_factor=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')
   HM_F=$(sed -n 's/^[[:space:]]*hidden.mesh_factor=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')
+  DP_P=$(sed -n 's/^[[:space:]]*hidden.drop_period=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')
 }
 THRESH=0
 [ -n "$LIM" ] && [ -n "$RATIO" ] && THRESH=$(( LIM * RATIO / 100 ))
@@ -77,7 +78,7 @@ for f in F1 F2 F3 F4 F5; do
 done
 
 # ---------- 维度 2：基础修复（/10） ----------
-B_PASS=0; B_TOTAL=13
+B_PASS=0; B_TOTAL=15
 NT="$EV/F1_nginx_T.txt"
 if [ -s "$NT" ] && [ -n "$LIM" ]; then
   MINB=""; MAXB=""; CNT=0
@@ -212,6 +213,38 @@ if [ -s "$F5R" ]; then
   fi
 else
   fail "F5b：evidence/F5_restart.txt 缺失（restart all 后重跑 collect_meshd 并保存）"
+fi
+# F8：隐藏采样周期推断（measured_period == hidden.drop_period）+ 修复后 100% 落盘
+F8F="$EV/F8_period.txt"
+DP=$(( ${DP_P:-0} ))
+if [ -s "$F8F" ] && [ "$DP" -ge 3 ] 2>/dev/null; then
+  MP=$(sed -n 's/^[[:space:]]*measured_period=//p' "$F8F" | head -n1 | tr -dc '0-9')
+  PL=$(sed -n 's/^[[:space:]]*post_fix_landed=//p' "$F8F" | head -n1 | tr -dc '0-9')
+  PN=$(sed -n 's/^[[:space:]]*post_fix_probes=//p' "$F8F" | head -n1 | tr -dc '0-9')
+  if [ -n "$MP" ] && [ "$MP" -eq "$DP" ] 2>/dev/null      && [ -n "$PN" ] && [ "$PN" -ge 20 ] 2>/dev/null && [ "$PL" -eq "$PN" ] 2>/dev/null; then
+    ok "F8：隐藏采样周期推断正确（measured=$MP == hidden $DP）且修复后 ${PL}/${PN} 全落盘"; B_PASS=$((B_PASS+1))
+  else
+    fail "F8：measured_period=${MP:-缺} ≠ hidden.drop_period=${DP}，或修复后落盘 ${PL:-缺}/${PN:-缺} 非全量——采样逻辑未定位或未修复"
+  fi
+else
+  fail "F8：evidence/F8_period.txt 缺失或 params hidden.drop_period 缺失（须发送 ≥20 标记探针统计落盘率推断周期）"
+fi
+# F9：多字节规格偏移差分（修复前 CJK 路由 delta ∈{1531,1533,1535}，修复后恰 1537）
+F9F="$EV/F9_offset.txt"
+if [ -s "$F9F" ]; then
+  PRE=$(grep -oE 'prefix_multibyte_delta=[0-9]+' "$F9F" | head -n1 | grep -oE '[0-9]+')
+  POST=$(grep -oE 'post_multibyte_delta=[0-9]+' "$F9F" | head -n1 | grep -oE '[0-9]+')
+  if [ -n "$PRE" ] && [ "$PRE" -ge 1530 ] 2>/dev/null && [ "$PRE" -le 1536 ] 2>/dev/null && [ "$PRE" != "1537" ]; then
+    if [ "$POST" = "1537" ]; then
+      ok "F9：多字节偏移差分成立（修复前 $PRE ≠ 1537 → 修复后恰 1537）"; B_PASS=$((B_PASS+1))
+    else
+      fail "F9：post_multibyte_delta=${POST:-缺} 须恰 1537（修复后规格恢复）"
+    fi
+  else
+    fail "F9：prefix_multibyte_delta=${PRE:-缺} 须 ∈{1531,1533,1535}（修复前多字节偏移未捕获）"
+  fi
+else
+  fail "F9：evidence/F9_offset.txt 缺失（差分实验：ASCII vs 多字节路由的逐跳 delta 对照）"
 fi
 # F2e：tracegate 修复前生效预算 == 故障基值 × hidden 因子（须实测标定，硬编码不通过）
 F3B="$EV/F3_budget.txt"

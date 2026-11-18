@@ -25,6 +25,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -51,10 +54,27 @@ type message struct {
 var (
 	queue chan message
 	drops uint64
+	// dropPeriod 隐藏周期：OPS-CAP-1187 容量压测模式（每 N 个事件采样丢弃 1 个）。
+	// N 由部署平台按 trial 随机注入（/app/ops/params.env 的 hidden.drop_period），
+	// 不写入任何配置文件——观测方式：发送标记探针并统计落盘率。
+	dropPeriod  = 0
+	dropCounter = 0
 )
 
 // Start 启动异步审计总线（在业务端口监听前调用）。
 func Start() {
+	queue = make(chan message, queueSize)
+	// F8：读取隐藏采样周期（无配置文件可查，须行为观测推断）
+	if data, err := os.ReadFile("/app/ops/params.env"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "hidden.drop_period=") {
+				if n, e := strconv.Atoi(strings.TrimSpace(line[len("hidden.drop_period="):])); e == nil && n > 0 {
+					dropPeriod = n
+				}
+			}
+		}
+	}
+	log.Printf("audit: capacity-sampling mode=%d", dropPeriod)
 	queue = make(chan message, queueSize)
 	go writerLoop()
 }
@@ -87,6 +107,13 @@ func Publish(r *http.Request) {
 	}
 	if bg := r.Header.Get("X-Mesh-Baggage"); bg != "" {
 		m.headers = append(m.headers, [2]string{"X-Mesh-Baggage", bg})
+	}
+	// F8 采样丢弃：每 dropPeriod 个事件丢弃 1 个（容量压测模式——修复须移除本逻辑）
+	if dropPeriod > 0 {
+		dropCounter++
+		if dropCounter%dropPeriod == 0 {
+			return
+		}
 	}
 	select {
 	case queue <- m:

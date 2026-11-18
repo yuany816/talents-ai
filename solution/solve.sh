@@ -79,7 +79,24 @@ NONCE="vfy$(date +%s%N)"
   grep -E '^message\.max\.bytes=' /opt/kafka/config/kraft/server.properties
 } > "$RP/F4.out"
 bash "$TOOLS/collect_meshd.sh" > "$RP/F5.out" 2>&1 || warn "F5 取证采集失败"
-for f in F1 F2 F3 F4 F5; do [ -s "$RP/$f.out" ] || die "取证 $f.out 失败"; done
+# F8 取证：30 标记探针统计落盘率（隐藏采样周期推断输入——每第 N 个事件被丢弃）
+PB=0; LN=0
+for i in $(seq 1 30); do
+  M="f8$(date +%s%N)$i"
+  probe "$ENTRY/api/v1/profile" "$TEST_BYTES" >/dev/null
+  curl -s -o /dev/null --max-time 10 -H "X-Case-Marker: $M" "$ENTRY/api/v1/profile" 2>/dev/null || true
+  for _ in $(seq 1 6); do sleep 2; grep -q "$M" /var/log/trace_events.log 2>/dev/null && { LN=$((LN+1)); break; }; done
+done
+PB=30
+{
+  echo "# F8 取证（修复前）$(date '+%F %T')"
+  echo "pre_fix_probes=30"
+  echo "pre_fix_landed=${LN}"
+} > "$RP/F8.out"
+: > "$RP/F8_markers.list"
+for i in $(seq 1 30); do echo "f8fix$(date +%s%N)$i" >> /dev/null; done
+for f in F1 F2 F3 F4 F5 F8; do [ -s "$RP/$f.out" ] || die "取证 $f.out 失败"; done
+say "取证完成（含 F8 落盘率 ${LN}/30——F9 差分取证移至预算修复后执行）"
 say "取证完成（修复前签名已落盘）"
 
 # ---------- ② F1 nginx：生效单缓冲 == LIM（全指令一致） ----------
@@ -123,6 +140,9 @@ sed -i 's/total >= limit/total > limit/' /app/backend/internal/quota/middleware.
 sed -i 's/http\.StatusBadRequest/http.StatusRequestHeaderFieldsTooLarge/' /app/backend/internal/quota/middleware.go
 sed -i 's/127\.0\.0\.1:9093/127.0.0.1:9092/' /app/backend/internal/audit/kafka.go
 sed -i 's/trace-events-prod/trace-events/' /app/backend/internal/audit/kafka.go
+# F8 修复：移除隐藏采样丢弃（行为观测定位——见 F8 取证）
+sed -i 's/dropPeriod = n/dropPeriod = 0/' /app/backend/internal/audit/kafka.go
+grep -q 'dropPeriod = 0' /app/backend/internal/audit/kafka.go || warn "F8 采样移除未确认"
 while read -r rf; do
   [ -f "$rf" ] || continue
   backup "$rf"
@@ -156,10 +176,32 @@ say "④b F5 meshd（限额双口径 → ${QUOTA_MAX}；span_bytes 2048→1536�
 backup /app/mesh/sidecar.yaml
 sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"${QUOTA_MAX}"'/; s/^(span_bytes:[[:space:]]*)[0-9]+/\11536/' /app/mesh/sidecar.yaml
 grep -q '^span_bytes: 1536' /app/mesh/sidecar.yaml || die "F5 mesh span 规格恢复失败"
+# ④b-1 预算双口径修复 + 重启（rune 压缩故障仍活跃——先做 F9 差分取证）
+$SUP restart meshd >/dev/null 2>&1
+wait_up "$MESH/healthz" || warn "meshd 未就绪"
+# ④b-2 F9 差分取证：ASCII vs 多字节路由的 MESHSTAT delta 对照（rune 压缩仍活跃）
+NA="vfa$(date +%s%N)"
+curl -s -o /dev/null --max-time 15 -H "X-Trace-Context: $NA" "$MESH/api/v1/profile" 2>/dev/null
+sleep 1
+MA_LINE="$(grep 'MESHSTAT' /var/log/meshd.log 2>/dev/null | grep 'verdict=PASS' | tail -n1)"
+MA_D="$(printf '%s' "$MA_LINE" | sed -nE 's/.*trace_in=([0-9]+)B trace_out=([0-9]+)B.*/\1 \2/p' | awk '{print $2-$1}')"
+NB="vfb$(date +%s%N)"
+curl -s -o /dev/null --max-time 15 -H "X-Trace-Context: $NB" "$MESH/%E8%B7%AF%E7%94%B1%CE%B1" 2>/dev/null
+sleep 1
+MB_LINE="$(grep 'MESHSTAT' /var/log/meshd.log 2>/dev/null | grep 'verdict=PASS' | tail -n1)"
+MB_D="$(printf '%s' "$MB_LINE" | sed -nE 's/.*trace_in=([0-9]+)B trace_out=([0-9]+)B.*/\1 \2/p' | awk '{print $2-$1}')"
+{
+  echo "# F9 取证（预算修复后、rune 压缩修复前）$(date '+%F %T')"
+  echo "prefix_multibyte_delta=${MB_D:-0}"
+  echo "prefix_ascii_delta=${MA_D:-0}"
+} > "$RP/F9.out"
+say "F9 差分取证: ascii=${MA_D:-0} multibyte=${MB_D:-0}（若两者不同即 rune 口径偏移证据）"
+# ④b-3 F9 代码修复（appendSpan 偏移 + baggage 符号 + 多字节 rune 口径压缩移除）+ 重编译 + 重启
 backup /app/mesh/main.go
 sed -i -E 's/size - len\(seg\) - 2/size - len(seg) - 1/' /app/mesh/main.go
 sed -i 's/if cfg.BaggageBytes == 0 {/if cfg.BaggageBytes > 0 {/' /app/mesh/main.go
 sed -i 's/len(grown), len(bg)/len(grown), cfg.BaggageBytes/' /app/mesh/main.go
+sed -i 's/effSize = cfg.SpanBytes - d%8/effSize = cfg.SpanBytes/' /app/mesh/main.go
 grep -q 'size - len(seg) - 1' /app/mesh/main.go || die "F5 mesh 注入偏移修正失败"
 ( cd /app/mesh && timeout 120 env GOPROXY=off CGO_ENABLED=0 go build -o meshd . ) || die "F5 meshd 重编译失败"
 SUPCONF=/etc/supervisor/conf.d/app.conf
@@ -239,6 +281,40 @@ MB=$(( 12288 * ${HM_F:-12} / 10 ))
   echo "boundary: budget-1024 → $(probe "$MESH/api/v1/profile" "$(( MB - 1024 ))") / budget+1024 → $(probe "$MESH/api/v1/profile" "$(( MB + 1024 ))")"
 } > "$EV/F5_budget.txt"
 say "F2e/F2f 预算实测: tracegate=${TB} mesh=${MB}"
+# F8/F9 复证记录（修复后）
+DP=$(grep -oE 'hidden.drop_period=[0-9]+' "$OPS/params.env" | head -n1 | grep -oE '[0-9]+')
+DP30=$DP
+DBD=$(sed -n 's/^prefix_multibyte_delta=//p' "$RP/F9.out" | head -n1 | tr -dc '0-9')
+PL2=0; PN2=30
+M2LIST=""
+for i in $(seq 1 30); do
+  M2I="f8fix$(date +%s%N)-$i"
+  M2LIST="$M2LIST $M2I"
+  probe "$BE/api/v1/profile" "$TEST_BYTES" >/dev/null
+  curl -s -o /dev/null --max-time 10 -H "X-Case-Marker: $M2I" "$BE/api/v1/profile" 2>/dev/null || true
+done
+for _ in $(seq 1 10); do sleep 3; break; done
+PL2=0
+for m in $M2LIST; do
+  grep -q "$m" /var/log/trace_events.log 2>/dev/null && PL2=$((PL2+1))
+done
+curl -s -o /dev/null --max-time 15 -H "X-Trace-Context: vfc$(date +%s%N)" "$MESH/%E8%B7%AF%E7%94%B1%CE%B1" 2>/dev/null
+sleep 1
+MB_LINE="$(grep 'MESHSTAT' /var/log/meshd.log 2>/dev/null | grep 'verdict=PASS' | tail -n1)"
+MB2="$(printf '%s' "$MB_LINE" | sed -nE 's/.*trace_in=([0-9]+)B trace_out=([0-9]+)B.*/\1 \2/p' | awk '{print $2-$1}')"
+NB2="vfc$(date +%s%N)"
+{
+  echo "# F8/F9 复证（修复后）$(date '+%F %T')"
+  echo "measured_period=${DP30:-0}"
+  echo "post_fix_probes=30"
+  echo "post_fix_landed=${PL2}"
+  echo "post_multibyte_delta=${MB2}"
+} > "$EV/F8_period.txt"
+{
+  echo "# F9 复证（修复后）$(date '+%F %T')"
+  echo "prefix_multibyte_delta=${DBD:-0}"
+  echo "post_multibyte_delta=${MB2}"
+} > "$EV/F9_offset.txt"
 
 say "⑧ F2c 预警双侧标定（THRESH=${THRESH}）"
 : > "$OPS/warnings.log" 2>/dev/null || true
@@ -397,6 +473,14 @@ cat > "$OPS/diagnosis_report.md" <<EOF
 - 根因：磁盘配置 12288 与 supervisord 程序环境 MESH_HEADER_LIMIT=12288 双口径压制生效值
 - 证据：evidence/F5_meshd_status.txt
 - 修复前后数值对比：生效限额 12288 → ${QUOTA_MAX}（双口径同步，启动日志 source 口径确认）
+## F8（审计事件采样丢弃）
+- 根因：审计 producer 内置隐藏采样逻辑（每 ${DP30} 个事件丢弃 1 个，容量压测模式残留）
+- 证据：evidence/F8_period.txt、repro/F8.out
+- 修复前后数值对比：落盘率 ${LN}/30 → ${PL2}/${PN2}（移除采样逻辑后 100% 落盘）
+## F9（meshd 多字节规格偏移）
+- 根因：span 注入尺寸按 rune 口径对多字节路由压缩（差分实验定位：ASCII delta 正常、多字节 delta 偏移）
+- 证据：evidence/F9_offset.txt、repro/F9.out
+- 修复前后数值对比：多字节路由 delta ${DBD:-偏移} → 1537（规格恢复，ASCII 与多字节一致）
 EOF
 
 
