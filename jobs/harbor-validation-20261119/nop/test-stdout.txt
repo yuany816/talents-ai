@@ -1,0 +1,42 @@
+[verifier] FAIL : 结构 repro/F1：脚本缺失/不可执行，或 Fx.out 缺失/无修复前故障签名
+[verifier] FAIL : 结构 repro/F2：脚本缺失/不可执行，或 Fx.out 缺失/无修复前故障签名
+[verifier] FAIL : 结构 repro/F3：脚本缺失/不可执行，或 Fx.out 缺失/无修复前故障签名
+[verifier] FAIL : 结构 repro/F4：脚本缺失/不可执行，或 Fx.out 缺失/无修复前故障签名
+[verifier] FAIL : 结构 repro/F5：脚本缺失/不可执行，或 Fx.out 缺失/无修复前故障签名
+[verifier] FAIL : 结构 fix/F1.sh 缺失/不可执行（修复脚本须落盘交付）
+[verifier] FAIL : 结构 fix/F2.sh 缺失/不可执行（修复脚本须落盘交付）
+[verifier] FAIL : 结构 fix/F3.sh 缺失/不可执行（修复脚本须落盘交付）
+[verifier] FAIL : 结构 fix/F4.sh 缺失/不可执行（修复脚本须落盘交付）
+[verifier] FAIL : 结构 fix/F5.sh 缺失/不可执行（修复脚本须落盘交付）
+[verifier] FAIL : B1：nginx 单缓冲（2 条，8192~16384）须全部 == LIM=35150
+[verifier] FAIL : B2：双侧边界（below=400 须 200；above=400 须为 400/413/431 之一——其余状态码是链路故障而非限额拒绝）
+[verifier] FAIL : B3：entry=400 backend=431 body={"code":0,"msg":"ok"}
+[verifier] FAIL : B4：banner warn_threshold=65536 ≠ THRESH=29877（须按 LIM×WARN_RATIO/100 联动）
+[verifier] FAIL : B5：restart all 后 entry=400 backend=431
+[verifier] FAIL : B6：预警双侧标定（above_delta=0 须≥1 / below_delta=0 须=0）
+[verifier] ok   : B7：tracegate 生效预算实测 65476 ≥ 16384（修复后放行探针）
+[verifier] FAIL : B8：mesh 生效预算 5956 < 16384
+[verifier] FAIL : B9：注入链规格（echo 增幅=-22 须 2306 / mesh delta=2047 须 1537）
+[verifier] FAIL : B10：broker 静态限额 16384 须 >16384
+[verifier] FAIL : B11：标记事件 30s 内未落盘
+[verifier] FAIL : B12：meshd 生效限额 14745 < 16384
+[verifier] ok   : B13：隐藏采样周期可见（30 探针落盘 0——丢失 30，N≈1）
+[verifier] FAIL : B14：多字节差分异常（ascii=2047 multibyte=2043——须恰 1537）
+[verifier] FAIL : B15：quality_gate.sh 缺失或不可执行
+P1 基础探针完成: 2/15
+[verifier] FAIL : 证据 F1_* 缺失
+[verifier] FAIL : 证据 F2_* 缺失
+[verifier] FAIL : 证据 F3_* 缺失
+[verifier] FAIL : 证据 F4_* 缺失
+[verifier] FAIL : 证据 F5_* 缺失
+[verifier] FAIL : 报告：未引用 F1 面证据文件相对路径（evidence/F1_*）
+[verifier] FAIL : 报告：未引用 F2 面证据文件相对路径（evidence/F2_*）
+[verifier] FAIL : 报告：未引用 F3 面证据文件相对路径（evidence/F3_*）
+[verifier] FAIL : 报告：未引用 F4 面证据文件相对路径（evidence/F4_*）
+[verifier] FAIL : 报告：未引用 F5 面证据文件相对路径（evidence/F5_*）
+===================================================================
+[verifier] P1 运维清单: 结构=0/10 基础=2/15 证据=0/5 报告=0/5 → P1=0.0467
+[verifier] FAIL : F7：/app/ops/bin/calibrator 缺失或不可执行，或 params.env 缺失——实现题 0 分
+[verifier] FAIL : F6：/app/ops/bin/headeragg 缺失或不可执行——实现题 0 分
+[verifier] CAP：repro 取证全缺，reward 封顶 0.4500
+[verifier] reward=0.0000 → /logs/verifier/reward.txt（诊断 → /logs/verifier/debug.txt）

@@ -1,0 +1,67 @@
+[verifier] ok   : 结构 repro/F1：脚本可执行 + 修复前取证签名匹配
+[verifier] ok   : 结构 repro/F2：脚本可执行 + 修复前取证签名匹配
+[verifier] ok   : 结构 repro/F3：脚本可执行 + 修复前取证签名匹配
+[verifier] ok   : 结构 repro/F4：脚本可执行 + 修复前取证签名匹配
+[verifier] ok   : 结构 repro/F5：脚本可执行 + 修复前取证签名匹配
+[verifier] ok   : 结构 fix/F1.sh 存在且可执行
+[verifier] ok   : 结构 fix/F2.sh 存在且可执行
+[verifier] ok   : 结构 fix/F3.sh 存在且可执行
+[verifier] ok   : 结构 fix/F4.sh 存在且可执行
+[verifier] ok   : 结构 fix/F5.sh 存在且可执行
+[verifier] ok   : B1：nginx 全部指令单缓冲 == LIM（1 条 = 39844B）
+[verifier] ok   : B2：双侧边界（LIM−1024=200 / LIM+4096=400 限额拒绝）
+[verifier] ok   : B3：端到端大探针 200 + 响应体特征
+[verifier] ok   : B4：预警阈值联动（banner warn_threshold=19922 == THRESH=19922）
+[verifier] ok   : B5：restart all 后全链路仍 200（持久化）
+[verifier] ok   : B6：预警双侧标定（above 增量 1 / below 增量 0）
+[verifier] ok   : B7：tracegate 生效预算实测 43816 ≥ 16384（修复后放行探针）
+[verifier] ok   : B8：mesh 生效预算实测 65476 ≥ 16384
+[verifier] ok   : B9：注入链规格（echo 增幅恰 2306 / mesh delta 恰 1537）
+[verifier] ok   : B10：broker 限额 static=1048576 / 动态覆盖=1048576 均 >16384
+[verifier] ok   : B11：标记事件落盘（LIVE Kafka 管道）
+[verifier] ok   : B12：meshd 生效限额 1048576 ≥ 16384
+[verifier] ok   : B13：30 探针全落盘（采样已移除）
+[verifier] ok   : B14：多字节规格差分（ASCII 与多字节路由 delta 恰 1537——规格恢复）
+[verifier] ok   : B15：门禁行为（干净过 / 431 注入拒）
+P1 基础探针完成: 15/15
+[verifier] ok   : 证据 F1_* 存在
+[verifier] ok   : 证据 F2_* 存在
+[verifier] ok   : 证据 F3_* 存在
+[verifier] ok   : 证据 F4_* 存在
+[verifier] ok   : 证据 F5_* 存在
+[verifier] ok   : 报告：引用 F1 面证据路径
+[verifier] ok   : 报告：引用 F2 面证据路径
+[verifier] ok   : 报告：引用 F3 面证据路径
+[verifier] ok   : 报告：引用 F4 面证据路径
+[verifier] ok   : 报告：引用 F5 面证据路径
+===================================================================
+[verifier] P1 运维清单: 结构=10/10 基础=15/15 证据=5/5 报告=5/5 → P1=1.0000
+[verifier] ok   : F7 场景 sc01.in 逐字节一致
+[verifier] ok   : F7 场景 sc02.in 逐字节一致
+[verifier] ok   : F7 场景 sc03.in 逐字节一致
+[verifier] ok   : F7 场景 sc04.in 逐字节一致
+[verifier] ok   : F7 场景 sc05.in 逐字节一致
+[verifier] ok   : F7 场景 sc06.in 逐字节一致
+[verifier] ok   : F7 场景 sc07.in 逐字节一致
+[verifier] ok   : F7 场景 sc08.in 逐字节一致
+[verifier] ok   : F7 场景 sc09.in 逐字节一致
+[verifier] ok   : F7 场景 sc10.in 逐字节一致
+[verifier] ok   : F7 场景 sc11.in 逐字节一致
+[verifier] ok   : F7 场景 sc12.in 逐字节一致
+[verifier] ok   : F6 场景 s1 双实例 stats 一致
+[verifier] ok   : F6 场景 s2 双实例 stats 一致
+[verifier] ok   : F6 场景 s3 双实例 stats 一致
+[verifier] ok   : F6 场景 s4 双实例 stats 一致
+[verifier] ok   : F6 场景 s5 双实例 stats 一致
+[verifier] ok   : F6 场景 s6 双实例 stats 一致
+[verifier] ok   : F6 场景 s7 双实例 stats 一致
+[verifier] ok   : F6 场景 s8 双实例 stats 一致
+/tests/test.sh: line 450:  8805 Killed                  "$HAGG" "$THRESH_F6" /tmp/f6-a.state 9200
+/tests/test.sh: line 450:  8806 Killed                  "$HREFB" "$THRESH_F6" /tmp/f6-r.state 9300
+[verifier] ok   : F6 场景 s9 双实例 stats 一致
+[verifier] ok   : F6 场景 s10 双实例 stats 一致
+[verifier] ok   : F6 场景 s11 双实例 stats 一致
+[verifier] ok   : F6 场景 s12 双实例 stats 一致
+/tests/test.sh: line 452:  9071 Killed                  "$HAGG" "$THRESH_F6" /tmp/f6-a.state 9200
+/tests/test.sh: line 452:  9072 Killed                  "$HREFB" "$THRESH_F6" /tmp/f6-r.state 9300
+[verifier] reward=1.0000 → /logs/verifier/reward.txt（诊断 → /logs/verifier/debug.txt）

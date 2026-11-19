@@ -1,0 +1,36 @@
+{
+  "verified_at": "2026-11-19T20:48:09+08:00",
+  "repository_commit": "1fd0615c4637a81397f11c62dd8e97fc64c09729",
+  "harbor_version": "0.26.0",
+  "task_name": "humanlaya/coding-task",
+  "verifier_environment_mode": "shared",
+  "oracle": {
+    "job": "oracle-verified-r2-20261119",
+    "trial_id": "harbor-prebuilt-task__3HRL9G6",
+    "reward": 1.0,
+    "reward_text": "1.0000",
+    "exceptions": 0,
+    "reward_valid": true
+  },
+  "nop": {
+    "job": "nop-verified-20261119",
+    "trial_id": "harbor-prebuilt-task__GaBdpp6",
+    "reward": 0.0,
+    "reward_text": "0.0000",
+    "exceptions": 0,
+    "reward_valid": true
+  },
+  "environment": {
+    "verification_image": "talents-ai-harbor-20261119:latest",
+    "image_source_commit": "c8477780b878c6bf51b70c9d11ab401e0f012fde",
+    "task_changed_since_image_commit": false,
+    "direct_cold_build": {
+      "job": "oracle-actual-20261119",
+      "trial_id": "task__XMVphb9",
+      "status": "environment_start_timeout",
+      "build_timeout_seconds": 600,
+      "score_produced": false,
+      "blocked_step": "Kafka 3.7.2 download from archive.apache.org"
+    }
+  }
+}
