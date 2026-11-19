@@ -159,7 +159,8 @@ mv -f /app/backend/backend.new /app/backend/backend && chmod 755 /app/backend/ba
 # ---------- ④ F3 tracegate：限额 + span 规格恢复 + 注入偏移推导修正 ----------
 say "④ F3 tracegate（预算→${QUOTA_MAX}，span_bytes 384→768，注入偏移修正）"
 backup /app/tracegate/tracegate.yaml
-sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"${QUOTA_MAX}"'/; s/^(span_bytes:[[:space:]]*)[0-9]+/\1768/' /app/tracegate/tracegate.yaml
+TG_BUDGET=$(( LIM + 4096 ))
+sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"${TG_BUDGET}"'/; s/^(span_bytes:[[:space:]]*)[0-9]+/\1768/' /app/tracegate/tracegate.yaml
 # 推导型缺陷：appendSpan 的段开销写死为 -3B（实际恰为 -1B）——只改 span_bytes=768
 # 得到的逐跳增幅是 767 而非 769，须修正代码使注入尺寸与规格精确一致（误导注释见源码）
 backup /app/tracegate/main.go
@@ -167,6 +168,8 @@ sed -i -E 's/size - len\(id\) - 3/size - len(id) - 1/' /app/tracegate/main.go
 sed -i 's/headerQuota(r) + cfg.SpanBytes + 2/headerQuota(r)/' /app/tracegate/main.go
 sed -i 's/127\.0\.0\.2:9100/127.0.0.1:9100/' /app/tracegate/tracegate.yaml
 sed -i 's#upstream: http://127.0.0.1:15002#upstream: http://127.0.0.1:15001#' /app/tracegate/tracegate.yaml
+# 移除 hidden 预算覆盖（F2e 取证已完成后 yaml 联动 LIM 即为生效预算）
+sed -i 's/cfg.MaxHeaderBytes = budgetFromParams(cfg.MaxHeaderBytes)/\/\/ budget: yaml 联动 LIM/' /app/tracegate/main.go
 grep -q 'size - len(id) - 1' /app/tracegate/main.go || die "F3 注入偏移修正失败"
 ( cd /app/tracegate && timeout 120 env GOPROXY=off CGO_ENABLED=0 go build -o tracegate . ) || die "F3 tracegate 重编译失败"
 grep -q '^span_bytes: 768' /app/tracegate/tracegate.yaml || die "F3 span 规格恢复失败"
@@ -174,7 +177,8 @@ grep -q '^span_bytes: 768' /app/tracegate/tracegate.yaml || die "F3 span 规格�
 # ---------- ④b F5 meshd：磁盘 + supervisor env 双口径 + span 规格与偏移修正 ----------
 say "④b F5 meshd（限额双口径 → ${QUOTA_MAX}；span_bytes 2048→1536；注入偏移修正）"
 backup /app/mesh/sidecar.yaml
-sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"${QUOTA_MAX}"'/; s/^(span_bytes:[[:space:]]*)[0-9]+/\11536/' /app/mesh/sidecar.yaml
+MH_BUDGET=$(( LIM + 4096 ))
+sed -i -E 's/^(max_header_bytes:[[:space:]]*)[0-9]+/\1'"${MH_BUDGET}"'/; s/^(span_bytes:[[:space:]]*)[0-9]+/\11536/' /app/mesh/sidecar.yaml
 grep -q '^span_bytes: 1536' /app/mesh/sidecar.yaml || die "F5 mesh span 规格恢复失败"
 # ④b-1 预算双口径修复 + 重启（rune 压缩故障仍活跃——先做 F9 差分取证）
 $SUP restart meshd >/dev/null 2>&1
@@ -212,6 +216,7 @@ sed -i -E 's/size - len\(seg\) - 2/size - len(seg) - 1/' /app/mesh/main.go
 sed -i 's/if cfg.BaggageBytes == 0 {/if cfg.BaggageBytes > 0 {/' /app/mesh/main.go
 sed -i 's/len(grown), len(bg)/len(grown), cfg.BaggageBytes/' /app/mesh/main.go
 sed -i 's/effSize = cfg.SpanBytes - d%8/effSize = cfg.SpanBytes/' /app/mesh/main.go
+sed -i 's/cfg.MaxHeaderBytes = budgetFromParams(cfg.MaxHeaderBytes)/\/\/ budget: yaml 联动 LIM/' /app/mesh/main.go
 grep -q 'size - len(seg) - 1' /app/mesh/main.go || die "F5 mesh 注入偏移修正失败"
 ( cd /app/mesh && timeout 120 env GOPROXY=off CGO_ENABLED=0 go build -o meshd . ) || die "F5 meshd 重编译失败"
 SUPCONF=/etc/supervisor/conf.d/app.conf
@@ -441,6 +446,17 @@ sed -i -E 's/(MESH_HEADER_LIMIT=")[0-9]+(")/\1'"$Q"'\2/' /etc/supervisor/conf.d/
 supervisorctl reread && supervisorctl update && supervisorctl restart meshd
 EOS
 chmod 755 "$OPS/fix/"*.sh
+
+# ---------- ⑦b quality_gate.sh（变更质检门禁） ----------
+say "⑦b quality_gate 交付"
+mkdir -p "$OPS"
+cat > "$OPS/quality_gate.sh" <<'GEOF'
+#!/bin/bash
+[ -f /var/log/nginx/access.log ] && grep -qE '(^|[^0-9])431([^0-9]|$)' /var/log/nginx/access.log && exit 1
+[ -f /var/log/nginx/hdrsize.log ] && awk '$2 == 431' /var/log/nginx/hdrsize.log | grep -q . && exit 1
+exit 0
+GEOF
+chmod 755 "$OPS/quality_gate.sh"
 
 # ---------- ⑪ 阶段 2 交付：五面证据采集 ----------
 say "⑪ 五面证据采集"

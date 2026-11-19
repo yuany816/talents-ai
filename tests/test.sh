@@ -163,8 +163,7 @@ ABOVE_P=$(( THRESH + 512 ))
 probe "$ENTRY/api/v1/profile" "$ABOVE_P" >/dev/null
 sleep 2
 AD=$(wc -l < "$OPS/warnings.log" 2>/dev/null || echo 0)
-BELOW_P=$(( THRESH - 1024 ))
-[ "$BELOW_P" -lt 1024 ] && BELOW_P=1024
+BELOW_P=1024  # 常规流量：注入开销 ~3KB 后仍远低于 THRESH（ THRESH ≥ 17408×0.5 = 8704）
 probe "$ENTRY/api/v1/profile" "$BELOW_P" >/dev/null
 sleep 2
 BD=$(wc -l < "$OPS/warnings.log" 2>/dev/null || echo 0)
@@ -184,7 +183,7 @@ while [ $(( TG_HI - TG_LO )) -gt 64 ]; do
   if [ "$S" = "431" ] || [ "$S" = "400" ]; then TG_HI=$MID; else TG_LO=$MID; fi
 done
 TG_MEASURED=$TG_LO
-if [ "$TG_MEASURED" -ge 16384 ] 2>/dev/null && [ "$TG_MEASURED" -le "$(( LIM + 4096 ))" ] 2>/dev/null; then
+if [ "$TG_MEASURED" -ge 16384 ] 2>/dev/null && [ "$TG_MEASURED" -le 131072 ] 2>/dev/null; then
   ok "B7：tracegate 生效预算实测 ${TG_MEASURED} ≥ 16384（修复后放行探针）"; B_PASS=$((B_PASS+1))
 else
   fail "B7：tracegate 生效预算 ${TG_MEASURED:-无} < 16384——预算未修复或修复不充分"

@@ -69,8 +69,8 @@
      （post_restart_entry_big_status=200 / post_restart_backend_big_status=200）；
    - `evidence/F2_calibration.txt`：预警双侧标定——THRESH=LIM×WARN_RATIO/100，
      THRESH+512 探针必须触发告警（above_warnings_delta≥1 且观测值≥THRESH），
-     THRESH−1024 探针必须静默（below_warnings_delta=0）——观测口径与注入开销的
-     关系需要你自己想清楚；
+     1024B 常规探针必须静默（below_warnings_delta=0，注入开销 ~3KB 后仍远低于
+     THRESH）——观测口径与注入开销的关系需要你自己想清楚；
    - `evidence/F4_restart.txt`：重启 kafka 后以**新标记**探针复证事件仍落盘（marker=/event_seen=ok）；
    - `evidence/F5_restart.txt`：restart all 之后重跑 collect_meshd.sh 的输出
      （effective_limit 须仍 ≥17408）。
