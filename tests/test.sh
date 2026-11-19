@@ -39,6 +39,7 @@ printf '%s\n' "0.0000" > "$REWARD_FILE"
 echo "ops_dir=present" >> "$DEBUG_FILE"
 
 # ---------- params.env ----------
+TEST_BYTES=16384
 LIM=""; RATIO=""; HT_F=0; HM_F=0
 [ -f "$OPS/params.env" ] && {
   LIM=$(sed -n 's/^[[:space:]]*LIM=//p' "$OPS/params.env" | head -n1 | tr -dc '0-9')
