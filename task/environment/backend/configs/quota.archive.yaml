@@ -1,0 +1,3 @@
+# 2025-Q4 容量评估存档（评估值，未走 CHANGE-431 变更流程，未上线）
+# 事实来源与加载路径见 internal/config/paths.go
+max_header_bytes: 16384
