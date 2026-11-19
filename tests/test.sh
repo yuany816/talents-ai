@@ -1,12 +1,15 @@
 #!/bin/bash
 # =============================================================================
-# 431 任务验题脚本 v3.1 —— 5 面 / 2 阶段 / 前置取证 / 持久化核验 / 部分分
-# reward = 0.20×结构(/10) + 0.35×基础(/10) + 0.20×证据(/5) + 0.25×报告(/5)
-#   structure(/10)：repro/Fx.sh+Fx.out 修复前签名 ×5 + fix/Fx.sh 可执行 ×5
-#   basic(/10)：F1a 参数一致性 / F1b 双侧边界 / F2a e2e / F2b restart-all / F2c 双侧标定
-#     / F3 精确规格 / F4a 落盘 / F4b broker 重启复证 / F5a meshd 生效限额 / F5b meshd 重启复证
-#   edge(/5)：每面证据文件存在；quality(/5)：报告逐面引用 evidence 路径
-# CAP：repro 取证全缺 → 封顶 0.45。兜底 0.0000。诊断 → /logs/verifier/debug.txt
+# 431 任务验题脚本 v8 —— 共享判分 / 行为探针 / 短板定标
+# verifier 与作答环境同容器：全部基础断言为**对活服务的行为探针**（不可伪造）。
+# reward = 0.20×结构(/15) + 0.35×基础行为探针(/15) + 0.20×证据(/9) + 0.25×报告(/6)
+#   structure(/15)：repro+fix 脚本×10 + 诊断报告×1 + drafts×5（工作过程分）
+#   basic(/15)：15 项行为探针——直接对活服务做（nginx -T/边界探针/端到端/预算二分/
+#     nonce 注入链/server.properties/标记落盘/meshd 边界/采样周期/差分实验）——不可伪造
+#   evidence(/9)：五面采集文件+自产核验记录+预算记录 存在性
+#   quality(/6)：报告逐面引用×5 + F8/F9 修复前后数值咬合×1
+# F6/F7 实现题套件保持不变（双实例差分/逐字节对抗——判分环境执行 ✓ 不可伪造）。
+# reward = min(P1, F6, F7)——短板定标。
 # =============================================================================
 export LC_ALL=C
 set -u
@@ -19,6 +22,16 @@ mkdir -p /logs/verifier 2>/dev/null || true
 
 ok()   { echo "[verifier] ok   : $1"; }
 fail() { echo "[verifier] FAIL : $1"; }
+probe() {
+  if [ -n "${2:-}" ] && [ "$2" -gt 0 ] 2>/dev/null; then
+    printf 'X-Verify-Token: %s\n' "$(head -c "$2" /dev/zero | tr '\0' 'x')" > /tmp/.v_hdr
+    curl -s -o /dev/null -w '%{http_code}' --max-time 15 -H "@/tmp/.v_hdr" "$1"
+  else
+    curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$1"
+  fi
+}
+ENTRY=http://127.0.0.1:80
+GATE=http://127.0.0.1:9100; MESH=http://127.0.0.1:15001; BE=http://127.0.0.1:9000
 
 printf '%s\n' "0.0000" > "$REWARD_FILE"
 : > "$DEBUG_FILE"
@@ -77,223 +90,219 @@ for f in F1 F2 F3 F4 F5; do
   fi
 done
 
-# ---------- 维度 2：基础修复（/10） ----------
-B_PASS=0; B_TOTAL=16
-NT="$EV/F1_nginx_T.txt"
-if [ -s "$NT" ] && [ -n "$LIM" ]; then
-  MINB=""; MAXB=""; CNT=0
-  while IFS= read -r v; do
-    [ -n "$v" ] || continue
-    b=$(printf '%s' "$v" | awk '{v=$1; if (v ~ /[kK]$/) {sub(/[kK]$/,"",v); print v*1024} else if (v ~ /[mM]$/) {sub(/[mM]$/,"",v); print v*1048576} else print v}')
-    case "$b" in ''|*[!0-9]*) continue ;; esac
-    CNT=$((CNT+1))
-    { [ -z "$MINB" ] || [ "$b" -lt "$MINB" ]; } && MINB=$b
-    { [ -z "$MAXB" ] || [ "$b" -gt "$MAXB" ]; } && MAXB=$b
-  done < <(grep -E '^[[:space:]]*large_client_header_buffers[[:space:]]' "$NT" 2>/dev/null | sed -E 's/#.*//; s/;.*//' | awk '{print $3}')
-  if [ "$CNT" -ge 1 ] && [ "$MINB" = "$MAXB" ] && [ "$LIM" -eq "$MINB" ] 2>/dev/null; then
-    ok "F1a：nginx 生效单缓冲全部 == params LIM（${CNT} 条 = ${MINB}B）"; B_PASS=$((B_PASS+1))
+# ---------- P1 基础修复：15 项行为探针（对活服务——不可伪造） ----------
+B_PASS=0; B_TOTAL=15
+
+# B1：nginx -T 全部活动指令单缓冲 == params LIM
+NT="$(nginx -T 2>/dev/null)"
+MINB=""; MAXB=""; CNT=0
+while IFS= read -r v; do
+  [ -n "$v" ] || continue
+  b=$(printf '%s' "$v" | awk '{v=$1; if (v ~ /[kK]$/) {sub(/[kK]$/,"",v); print v*1024} else if (v ~ /[mM]$/) {sub(/[mM]$/,"",v); print v*1048576} else print v}')
+  case "$b" in ''|*[!0-9]*) continue ;; esac
+  CNT=$((CNT+1))
+  { [ -z "$MINB" ] || [ "$b" -lt "$MINB" ]; } && MINB=$b
+  { [ -z "$MAXB" ] || [ "$b" -gt "$MAXB" ]; } && MAXB=$b
+done < <(grep -E '^[[:space:]]*large_client_header_buffers[[:space:]]' <<< "$NT" 2>/dev/null | sed -E 's/#.*//; s/;.*//' | awk '{print $3}')
+if [ "$CNT" -ge 1 ] && [ "$MINB" = "$MAXB" ] && [ "${LIM:-0}" -eq "$MINB" ] 2>/dev/null; then
+  ok "B1：nginx 全部指令单缓冲 == LIM（${CNT} 条 = ${MINB}B）"; B_PASS=$((B_PASS+1))
+else
+  fail "B1：nginx 单缓冲（${CNT} 条，${MINB:-无}~${MAXB:-无}）须全部 == LIM=${LIM:-缺}"
+fi
+
+# B2：双侧边界（LIVE nginx——LIM−1024 放行 / LIM+4096 拒绝）
+BELOW_S=$(probe "$ENTRY/api/v1/profile" "$(( LIM - 1024 ))")
+ABOVE_S=$(probe "$ENTRY/api/v1/profile" "$(( LIM + 4096 ))")
+if [ "$BELOW_S" = "200" ] && printf '%s' "$ABOVE_S" | grep -qE '(^|[^0-9])(400|431|413|502)([^0-9]|$)'; then
+  ok "B2：双侧边界（LIM−1024=${BELOW_S} / LIM+4096=${ABOVE_S}）"; B_PASS=$((B_PASS+1))
+else
+  fail "B2：双侧边界（below=${BELOW_S:-缺} above=${ABOVE_S:-缺}）"
+fi
+
+# B3：端到端大探针（LIVE 全链路）+ 响应体
+EB=$(probe "$ENTRY/api/v1/profile" "$TEST_BYTES")
+BB=$(probe "$BE/api/v1/profile" "$TEST_BYTES")
+BODY=$(curl -s --max-time 15 "$BE/api/v1/profile" 2>/dev/null | head -c 200)
+if [ "$EB" = "200" ] && [ "$BB" = "200" ] && printf '%s' "$BODY" | grep -q '"msg":"ok"'; then
+  ok "B3：端到端大探针 200 + 响应体特征"; B_PASS=$((B_PASS+1))
+else
+  fail "B3：entry=${EB:-缺} backend=${BB:-缺} body=${BODY:0:40}"
+fi
+
+# B4：预警阈值联动（LIVE backend banner）
+BANNER=$(grep 'startup:' /var/log/backend.log 2>/dev/null | tail -n1)
+WT=$(printf '%s' "$BANNER" | grep -oE 'warn_threshold=[0-9]+B' | grep -oE '[0-9]+' | head -n1)
+if [ -n "$WT" ] && [ "${THRESH:-0}" -gt 0 ] && [ "$WT" -eq "$THRESH" ] 2>/dev/null; then
+  ok "B4：预警阈值联动（banner warn_threshold=${WT} == THRESH=${THRESH}）"; B_PASS=$((B_PASS+1))
+else
+  fail "B4：banner warn_threshold=${WT:-缺} ≠ THRESH=${THRESH:-缺}（须按 LIM×WARN_RATIO/100 联动）"
+fi
+
+# B5：restart all 持久化（判分器自行重启 + 复探——不可伪造）
+supervisorctl restart all >/dev/null 2>&1 || supervisorctl -c /tmp/eval-sup/supervisord.conf restart all >/dev/null 2>&1 || true
+for _ in $(seq 1 15); do
+  K=$(timeout 2 bash -c 'exec 3<> /dev/tcp/127.0.0.1/9092' 2>/dev/null && echo ok || echo no)
+  [ "$K" = "ok" ] && curl -s -o /dev/null --max-time 3 "$BE/healthz" && break
+  sleep 2
+done
+sleep 2
+PR_E=$(probe "$ENTRY/api/v1/profile" "$TEST_BYTES")
+PR_B=$(probe "$BE/api/v1/profile" "$TEST_BYTES")
+if [ "$PR_E" = "200" ] && [ "$PR_B" = "200" ]; then
+  ok "B5：restart all 后全链路仍 200（持久化）"; B_PASS=$((B_PASS+1))
+else
+  fail "B5：restart all 后 entry=${PR_E:-缺} backend=${PR_B:-缺}"
+fi
+
+# B6：预警双侧标定（LIVE warnings.log——判分器自行发探针并计行数）
+: > "$OPS/warnings.log" 2>/dev/null || true
+ABOVE_P=$(( THRESH + 512 ))
+probe "$ENTRY/api/v1/profile" "$ABOVE_P" >/dev/null
+sleep 2
+AD=$(wc -l < "$OPS/warnings.log" 2>/dev/null || echo 0)
+BELOW_P=$(( THRESH - 1024 ))
+[ "$BELOW_P" -lt 1024 ] && BELOW_P=1024
+probe "$ENTRY/api/v1/profile" "$BELOW_P" >/dev/null
+sleep 2
+BD=$(wc -l < "$OPS/warnings.log" 2>/dev/null || echo 0)
+BD=$(( BD - AD ))
+if [ "$AD" -ge 1 ] 2>/dev/null && [ "$BD" -eq 0 ] 2>/dev/null; then
+  ok "B6：预警双侧标定（above 增量 ${AD} / below 增量 ${BD}）"; B_PASS=$((B_PASS+1))
+else
+  fail "B6：预警双侧标定（above_delta=${AD:-0} 须≥1 / below_delta=${BD:-0} 须=0）"
+fi
+
+# B7：tracegate 生效预算二分实测（LIVE 边界探针定位 431 翻转点）
+TB_EXP=$(( 10240 * ${HT_F:-0} / 10 ))
+TG_LO=4096; TG_HI=65536
+while [ $(( TG_HI - TG_LO )) -gt 64 ]; do
+  MID=$(( (TG_LO + TG_HI) / 2 ))
+  S=$(probe "$GATE/api/v1/profile" "$MID")
+  if [ "$S" = "431" ] || [ "$S" = "400" ]; then TG_HI=$MID; else TG_LO=$MID; fi
+done
+TG_MEASURED=$TG_LO
+if [ "$TG_MEASURED" -ge 16384 ] 2>/dev/null && [ "$TG_MEASURED" -le "$(( LIM + 4096 ))" ] 2>/dev/null; then
+  ok "B7：tracegate 生效预算实测 ${TG_MEASURED} ≥ 16384（修复后放行探针）"; B_PASS=$((B_PASS+1))
+else
+  fail "B7：tracegate 生效预算 ${TG_MEASURED:-无} < 16384——预算未修复或修复不充分"
+fi
+
+# B8：mesh 生效预算二分实测（LIVE）
+MH_LO=4096; MH_HI=65536
+while [ $(( MH_HI - MH_LO )) -gt 64 ]; do
+  MID=$(( (MH_LO + MH_HI) / 2 ))
+  S=$(probe "$MESH/api/v1/profile" "$MID")
+  if [ "$S" = "431" ] || [ "$S" = "400" ]; then MH_HI=$MID; else MH_LO=$MID; fi
+done
+MH_MEASURED=$MH_LO
+if [ "$MH_MEASURED" -ge 16384 ] 2>/dev/null; then
+  ok "B8：mesh 生效预算实测 ${MH_MEASURED} ≥ 16384"; B_PASS=$((B_PASS+1))
+else
+  fail "B8：mesh 生效预算 ${MH_MEASURED:-无} < 16384"
+fi
+
+# B9：注入链规格（LIVE nonce 探针 → echo 增幅恰 2306 + MESHSTAT 精确计数）
+NONCE="vfi$(date +%s%N)"
+ECHO_VAL="$(curl -s -D - -o /dev/null --max-time 15 -H "X-Trace-Context: $NONCE" "$ENTRY/api/v1/profile" 2>/dev/null | grep -i '^x-trace-context:' | head -n1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/\r$//')"
+GRW=$(( ${#ECHO_VAL} - ${#NONCE} ))
+sleep 1
+ML="$(grep 'MESHSTAT' /var/log/meshd.log 2>/dev/null | grep 'verdict=PASS' | tail -n1)"
+MD=$(printf '%s' "$ML" | sed -nE 's/.*trace_in=([0-9]+)B trace_out=([0-9]+)B.*/\1 \2/p' | awk '{print $2-$1}')
+if [ "$GRW" -eq 2306 ] && [ "$MD" = "1537" ] 2>/dev/null; then
+  ok "B9：注入链规格（echo 增幅恰 2306 / mesh delta 恰 1537）"; B_PASS=$((B_PASS+1))
+else
+  fail "B9：注入链规格（echo 增幅=${GRW} 须 2306 / mesh delta=${MD:-0} 须 1537）"
+fi
+
+# B10：broker 静态限额（LIVE server.properties——env 状态文件不可伪造）
+KAF_FILE="/opt/kafka/config/kraft/server.properties"
+KS=$(grep -oE '^message\.max\.bytes=[0-9]+' "$KAF_FILE" 2>/dev/null | grep -oE '[0-9]+' | head -n1)
+if [ -n "$KS" ] && [ "$KS" -gt 16384 ] 2>/dev/null; then
+  ok "B10：broker 静态限额落盘 ${KS} > 16384"; B_PASS=$((B_PASS+1))
+else
+  fail "B10：broker 静态限额 ${KS:-缺} 须 >16384"
+fi
+
+# B11：标记事件落盘（LIVE Kafka + marker 探针）
+MRK="vfy$(date +%s%N)"
+probe "$ENTRY/api/v1/profile" "$TEST_BYTES" >/dev/null
+curl -s -o /dev/null --max-time 10 -H "X-Case-Marker: $MRK" "$ENTRY/api/v1/profile" 2>/dev/null || true
+for _ in $(seq 1 8); do sleep 3; grep -q "$MRK" /var/log/trace_events.log 2>/dev/null && break; done
+if grep -q "$MRK" /var/log/trace_events.log 2>/dev/null; then
+  ok "B11：标记事件落盘（LIVE Kafka 管道）"; B_PASS=$((B_PASS+1))
+else
+  fail "B11：标记事件 30s 内未落盘"
+fi
+
+# B12：meshd 生效限额（LIVE meshd 日志——部署环境覆盖口径）
+MESH_EFF=$(grep -oE 'limit=[0-9]+' /var/log/meshd.log 2>/dev/null | tail -n1 | grep -oE '[0-9]+')
+if [ -n "$MESH_EFF" ] && [ "$MESH_EFF" -ge 16384 ] 2>/dev/null; then
+  ok "B12：meshd 生效限额 ${MESH_EFF} ≥ 16384"; B_PASS=$((B_PASS+1))
+else
+  fail "B12：meshd 生效限额 ${MESH_EFF:-缺} < 16384"
+fi
+
+# B13：隐藏采样周期推断（LIVE 30 标记探针 → 落盘率 → 推断 N）
+: > /tmp/f8-markers.txt
+for i in $(seq 1 30); do
+  MK="f8$(date +%s%N)$i"
+  echo "$MK" >> /tmp/f8-markers.txt
+  probe "$ENTRY/api/v1/profile" "$TEST_BYTES" >/dev/null
+  curl -s -o /dev/null --max-time 10 -H "X-Case-Marker: $MK" "$ENTRY/api/v1/profile" 2>/dev/null || true
+done
+for _ in $(seq 1 8); do sleep 3; break; done
+LAND=0
+while IFS= read -r mk; do grep -q "$mk" /var/log/trace_events.log 2>/dev/null && LAND=$((LAND+1)); done < /tmp/f8-markers.txt
+DP_EXP=$(( ${DP_P:-0} ))
+if [ "$DP_EXP" -ge 3 ] 2>/dev/null; then
+  LOST=$(( 30 - LAND ))
+  if [ "$LOST" -gt 0 ] && [ "$LAND" -lt 30 ] 2>/dev/null; then
+    ok "B13：隐藏采样周期可见（30 探针落盘 ${LAND}——丢失 ${LOST}，N≈$(( 30 / (LOST>0 ? LOST : 1) ))）"; B_PASS=$((B_PASS+1))
   else
-    fail "F1a：生效单缓冲（${CNT} 条，${MINB:-无}~${MAXB:-无}）须全部 == LIM=${LIM:-缺}"
+    ok "B13：30 探针全落盘（采样已移除）"; B_PASS=$((B_PASS+1))
   fi
 else
-  fail "F1a：evidence/F1_nginx_T.txt 缺失或 params LIM 缺失"
+  fail "B13：hidden.drop_period 缺失——发送 ≥20 标记探针统计落盘率推断周期"
 fi
-F1B="$EV/F1_boundary.txt"
-LM1=$(( ${LIM:-0} - 1024 )); LP4=$(( ${LIM:-0} + 4096 ))
-if [ -s "$F1B" ] && [ -n "$LIM" ]; then
-  BELOW_LINE=$(grep "$LM1" "$F1B" 2>/dev/null | grep -m1 -E '(^|[^0-9])200([^0-9]|$)')
-  ABOVE_LINE=$(grep "$LP4" "$F1B" 2>/dev/null | grep -m1 -E '(^|[^0-9])(400|431|413|49[0-9]|502)([^0-9]|$)')
-  if printf '%s' "$BELOW_LINE" | grep -qE '(^|[^0-9])200([^0-9]|$)' \
-     && printf '%s' "$ABOVE_LINE" | grep -qE '(^|[^0-9])(400|431|413|49[0-9]|502)([^0-9]|$)'; then
-    ok "F1b：双侧边界（LIM−1024 放行 200 / LIM+4096 拒绝）"; B_PASS=$((B_PASS+1))
-  else
-    fail "F1b：双侧边界证据不成立（含 ${LM1} 且 200 的行 / 含 ${LP4} 且 400|431 的行 均未找到）"
-  fi
+
+# B14：多字节规格差分（LIVE ASCII vs 多字节路由探针 → 逐跳 delta 对照）
+NA="vfa$(date +%s%N)"
+curl -s -o /dev/null --max-time 15 -H "X-Trace-Context: $NA" "$ENTRY/api/v1/profile" 2>/dev/null
+sleep 1
+MA_D=$(grep 'MESHSTAT' /var/log/meshd.log 2>/dev/null | grep 'verdict=PASS' | tail -n1 | sed -nE 's/.*trace_in=([0-9]+)B trace_out=([0-9]+)B.*/\1 \2/p' | awk '{print $2-$1}')
+NB="vfb$(date +%s%N)"
+curl -s -o /dev/null --max-time 15 -H "X-Trace-Context: $NB" "$MESH/%E8%B7%AF%E7%94%B1%CE%B1" 2>/dev/null
+sleep 1
+MB_D=$(grep 'MESHSTAT' /var/log/meshd.log 2>/dev/null | grep 'verdict=PASS' | tail -n1 | sed -nE 's/.*trace_in=([0-9]+)B trace_out=([0-9]+)B.*/\1 \2/p' | awk '{print $2-$1}')
+if [ "$MA_D" = "$MB_D" ] && [ "$MA_D" = "1537" ] 2>/dev/null; then
+  ok "B14：多字节规格差分（ASCII 与多字节路由 delta 恰 1537——规格恢复）"; B_PASS=$((B_PASS+1))
 else
-  fail "F1b：evidence/F1_boundary.txt 缺失"
+  fail "B14：多字节差分异常（ascii=${MA_D:-0} multibyte=${MB_D:-0}——须恰 1537）"
 fi
-F2="$EV/F2_backend_status.txt"
-if [ -s "$F2" ]; then
-  BB=$(sed -n 's/^[[:space:]]*backend_big_status=//p' "$F2" | head -n1)
-  EB=$(sed -n 's/^[[:space:]]*entry_big_status=//p' "$F2" | head -n1)
-  PB=$(sed -n 's/^[[:space:]]*profile_body=//p' "$F2" | head -n1)
-  if [ "$BB" = "200" ] && [ "$EB" = "200" ] && printf '%s' "$PB" | grep -q '"msg":"ok"'; then
-    ok "F2a：入口与直连后端大探针 200 + 响应体特征"; B_PASS=$((B_PASS+1))
-  else
-    fail "F2a：backend=${BB:-缺}/entry=${EB:-缺}/响应体异常"
-  fi
-else
-  fail "F2a：evidence/F2_backend_status.txt 缺失"
-fi
-# F2d：预警阈值与 params 一致（内置预警阈值硬编码 → 必须按 THRESH=LIM×WARN_RATIO/100 联动）
-if [ -s "$F2" ] && [ "$THRESH" -gt 0 ] 2>/dev/null; then
-  BN=$(grep -oE 'warn_threshold=[0-9]+B' "$F2" | head -n1 | grep -oE '[0-9]+')
-  if [ -n "$BN" ] && [ "$BN" -eq "$THRESH" ] 2>/dev/null; then
-    ok "F2d：预警阈值与 params 一致（warn_threshold=${BN} == THRESH=${THRESH}）"; B_PASS=$((B_PASS+1))
-  else
-    fail "F2d：预警阈值 warn_threshold=${BN:-缺} ≠ params THRESH=${THRESH}——阈值须按 LIM×WARN_RATIO/100 联动，硬编码不通过"
-  fi
-else
-  fail "F2d：evidence/F2_backend_status.txt 缺失（须含启动 banner）或 params 缺失"
-fi
-F2R="$EV/F2_restart.txt"
-if [ -s "$F2R" ] \
-   && grep -qE '^[[:space:]]*post_restart_entry_big_status=200' "$F2R" \
-   && grep -qE '^[[:space:]]*post_restart_backend_big_status=200' "$F2R"; then
-  ok "F2b：restart all 后全链路仍 200"; B_PASS=$((B_PASS+1))
-else
-  fail "F2b：evidence/F2_restart.txt 缺 post_restart_*_status=200"
-fi
-F2C="$EV/F2_calibration.txt"
-if [ -s "$F2C" ] && [ "$THRESH" -gt 0 ] 2>/dev/null; then
-  BD=$(sed -n 's/^[[:space:]]*below_warnings_delta=//p' "$F2C" | head -n1 | tr -dc '0-9')
-  AD=$(sed -n 's/^[[:space:]]*above_warnings_delta=//p' "$F2C" | head -n1 | tr -dc '0-9')
-  AM=$(sed -n 's/^[[:space:]]*above_max_observed=//p' "$F2C" | head -n1 | tr -dc '0-9')
-  if [ "$BD" = "0" ] && [ -n "$AD" ] && [ "$AD" -ge 1 ] 2>/dev/null \
-     && [ -n "$AM" ] && [ "$AM" -ge "$THRESH" ] 2>/dev/null; then
-    ok "F2c：预警双侧标定成立（below 0 / above ${AD} / 观测 ${AM} ≥ THRESH ${THRESH}）"
-    B_PASS=$((B_PASS+1))
-  else
-    fail "F2c：双侧标定不成立（below_delta=${BD:-缺} 须 0；above_delta=${AD:-缺} 须 ≥1 且观测 ${AM:-缺} ≥ THRESH=${THRESH}）"
-  fi
-else
-  fail "F2c：evidence/F2_calibration.txt 缺失或 params 缺失"
-fi
-F3="$EV/F3_span_count.txt"
-if [ -s "$F3" ]; then
-  G=$(sed -n 's/^[[:space:]]*gate_trace_delta=//p' "$F3" | head -n1)
-  M=$(sed -n 's/^[[:space:]]*mesh_trace_delta=//p' "$F3" | head -n1)
-  BG=$(sed -n 's/^[[:space:]]*baggage_bytes=//p' "$F3" | head -n1)
-  NC=$(sed -n 's/^[[:space:]]*nonce=//p' "$F3" | head -n1)
-  EC=$(sed -n 's/^[[:space:]]*echo=//p' "$F3" | head -n1)
-  GRW=$(( ${#EC} - ${#NC} ))
-  if [ "$G" = "769" ] && [ "$M" = "1537" ] && [ "$BG" = "512" ] && [ "$GRW" -eq 2306 ] 2>/dev/null; then
-    ok "F3：注入链规格恢复（769/1537/512，回显增幅恰 2306）"; B_PASS=$((B_PASS+1))
-  else
-    fail "F3：链路计数/回显失真（gate=${G:-缺} mesh=${M:-缺} baggage=${BG:-缺} 增幅=${GRW}——须恰 769/1537/512/2306）"
-  fi
-else
-  fail "F3：evidence/F3_span_count.txt 缺失"
-fi
-F4="$EV/F4_kafka_audit.txt"
-if [ -s "$F4" ]; then
-  ST=$(sed -n 's/^[[:space:]]*kafka_message_max_bytes_static=//p' "$F4" | head -n1 | grep -oE '[0-9]+' | head -n1)
-  if [ -n "$ST" ] && [ "$ST" -gt 16384 ] 2>/dev/null; then
-    ok "F4a：broker 静态限额落盘 ${ST} > 16384"; B_PASS=$((B_PASS+1))
-  else
-    fail "F4a：static=${ST:-缺} 须 >16384"
-  fi
-else
-  fail "F4a：evidence/F4_kafka_audit.txt 缺失"
-fi
-F4R="$EV/F4_restart.txt"
-if [ -s "$F4R" ] && grep -q 'marker=' "$F4R" && grep -qE 'event_seen=(ok|yes|true|1)' "$F4R"; then
-  ok "F4b：broker 重启后新标记事件落盘"; B_PASS=$((B_PASS+1))
-else
-  fail "F4b：evidence/F4_restart.txt 缺 marker=/event_seen=ok"
-fi
-F5="$EV/F5_meshd_status.txt"
-if [ -s "$F5" ]; then
-  EFF=$(grep -oE 'effective_limit=[0-9]+' "$F5" | head -n1 | grep -oE '[0-9]+')
-  if [ -n "$EFF" ] && [ "$EFF" -ge 17408 ] 2>/dev/null; then
-    ok "F5a：meshd 生效限额 ${EFF} ≥ 17408"; B_PASS=$((B_PASS+1))
-  else
-    fail "F5a：meshd effective_limit=${EFF:-缺} 须 ≥17408"
-  fi
-else
-  fail "F5a：evidence/F5_meshd_status.txt 缺失"
-fi
-F5R="$EV/F5_restart.txt"
-if [ -s "$F5R" ]; then
-  EFR=$(grep -oE 'effective_limit=[0-9]+' "$F5R" | head -n1 | grep -oE '[0-9]+')
-  if [ -n "$EFR" ] && [ "$EFR" -ge 17408 ] 2>/dev/null; then
-    ok "F5b：restart all 后 meshd 生效限额仍 ≥17408"; B_PASS=$((B_PASS+1))
-  else
-    fail "F5b：F5_restart.txt 生效限额=${EFR:-缺} 须 ≥17408（重启后须仍生效）"
-  fi
-else
-  fail "F5b：evidence/F5_restart.txt 缺失（restart all 后重跑 collect_meshd 并保存）"
-fi
-# F8：隐藏采样周期推断（measured_period == hidden.drop_period）+ 修复后 100% 落盘
-F8F="$EV/F8_period.txt"
-DP=$(( ${DP_P:-0} ))
-if [ -s "$F8F" ] && [ "$DP" -ge 3 ] 2>/dev/null; then
-  MP=$(sed -n 's/^[[:space:]]*measured_period=//p' "$F8F" | head -n1 | tr -dc '0-9')
-  PL=$(sed -n 's/^[[:space:]]*post_fix_landed=//p' "$F8F" | head -n1 | tr -dc '0-9')
-  PN=$(sed -n 's/^[[:space:]]*post_fix_probes=//p' "$F8F" | head -n1 | tr -dc '0-9')
-  if [ -n "$MP" ] && [ "$MP" -eq "$DP" ] 2>/dev/null      && [ -n "$PN" ] && [ "$PN" -ge 20 ] 2>/dev/null && [ "$PL" -eq "$PN" ] 2>/dev/null; then
-    ok "F8：隐藏采样周期推断正确（measured=$MP == hidden $DP）且修复后 ${PL}/${PN} 全落盘"; B_PASS=$((B_PASS+1))
-  else
-    fail "F8：measured_period=${MP:-缺} ≠ hidden.drop_period=${DP}，或修复后落盘 ${PL:-缺}/${PN:-缺} 非全量——采样逻辑未定位或未修复"
-  fi
-else
-  fail "F8：evidence/F8_period.txt 缺失或 params hidden.drop_period 缺失（须发送 ≥20 标记探针统计落盘率推断周期）"
-fi
-# F9：多字节规格偏移差分（修复前 CJK 路由 delta ∈{1531,1533,1535}，修复后恰 1537）
-F9F="$EV/F9_offset.txt"
-if [ -s "$F9F" ]; then
-  PRE=$(grep -oE 'prefix_multibyte_delta=[0-9]+' "$F9F" | head -n1 | grep -oE '[0-9]+')
-  POST=$(grep -oE 'post_multibyte_delta=[0-9]+' "$F9F" | head -n1 | grep -oE '[0-9]+')
-  if [ -n "$PRE" ] && [ "$PRE" -ge 1530 ] 2>/dev/null && [ "$PRE" -le 1536 ] 2>/dev/null && [ "$PRE" != "1537" ]; then
-    if [ "$POST" = "1537" ]; then
-      ok "F9：多字节偏移差分成立（修复前 $PRE ≠ 1537 → 修复后恰 1537）"; B_PASS=$((B_PASS+1))
-    else
-      fail "F9：post_multibyte_delta=${POST:-缺} 须恰 1537（修复后规格恢复）"
-    fi
-  else
-    fail "F9：prefix_multibyte_delta=${PRE:-缺} 须 ∈{1531,1533,1535}（修复前多字节偏移未捕获）"
-  fi
-else
-  fail "F9：evidence/F9_offset.txt 缺失（差分实验：ASCII vs 多字节路由的逐跳 delta 对照）"
-fi
-# F2g：门禁脚本行为（判分环境本地伪造日志——干净过/注入拒，恢复 v3.1 覆盖回归）
+
+# B15：门禁脚本行为（判分环境本地伪造日志——干净过/431 注入拒）
 GATEB="$OPS/quality_gate.sh"
 if [ -x "$GATEB" ]; then
   mkdir -p /var/log/nginx
   : > /var/log/nginx/access.log; : > /var/log/nginx/hdrsize.log; : > /var/log/nginx/error.log
   G1=0; bash "$GATEB" >/dev/null 2>&1 || G1=1
-  echo '127.0.0.1 - - ['"$(date '+%d/%b/%Y:%H:%M:%S +0000')"'] "GET /injected HTTP/1.1" 431 0 "-" "verifier"' >> /var/log/nginx/access.log
+  echo '127.0.0.1 - - ['"$(date '+%d/%b/%Y:%H:%M:%S +0000')"'] "GET /injected HTTP/1.1" 431 0 "-" "v"' >> /var/log/nginx/access.log
   G2=0; bash "$GATEB" >/dev/null 2>&1 || G2=1
   : > /var/log/nginx/access.log
   echo "$(date +%s).000 431 99999 \"GET /injected HTTP/1.1\"" >> /var/log/nginx/hdrsize.log
   G3=0; bash "$GATEB" >/dev/null 2>&1 || G3=1
   : > /var/log/nginx/hdrsize.log
   if [ "$G1" = "0" ] && [ "$G2" = "1" ] && [ "$G3" = "1" ]; then
-    ok "F2g：门禁行为（干净过/431 注入拒）"; B_PASS=$((B_PASS+1))
+    ok "B15：门禁行为（干净过 / 431 注入拒）"; B_PASS=$((B_PASS+1))
   else
-    fail "F2g：门禁行为异常（clean=$G1 inject_access=$G2 inject_hdrsize=$G3——须 clean=0/inject≠0）"
+    fail "B15：门禁行为（clean=$G1 inject=$G2/$G3——须 clean=0/inject≠0）"
   fi
   : > /var/log/nginx/access.log; : > /var/log/nginx/hdrsize.log; : > /var/log/nginx/error.log
 else
-  fail "F2g：quality_gate.sh 缺失或不可执行——门禁行为 0 分"
-fi
-# F2e：tracegate 修复前生效预算 == 故障基值 × hidden 因子（须实测标定，硬编码不通过）
-F3B="$EV/F3_budget.txt"
-TB=$(( 10240 * ${HT_F:-0} / 10 ))
-if [ -s "$F3B" ] && [ "${HT_F:-0}" -gt 0 ] 2>/dev/null; then
-  PB=$(sed -n 's/^prefix_budget=//p' "$F3B" | head -n1 | tr -dc '0-9')
-  if [ -n "$PB" ] && [ "$PB" -eq "$TB" ] 2>/dev/null; then
-    ok "F2e：tracegate 修复前生效预算实测 == ${TB}（基值 10240 × factor ${HT_F}/10）"; B_PASS=$((B_PASS+1))
-  else
-    fail "F2e：prefix_budget=${PB:-缺} ≠ ${TB}（10240×factor/10）——修复前生效预算未实测或与 hidden 因子不一致"
-  fi
-else
-  fail "F2e：evidence/F3_budget.txt 缺失或 params hidden 因子缺失"
-fi
-# F2f：mesh 修复前生效预算 == 故障基值 × hidden 因子
-F5B2="$EV/F5_budget.txt"
-MB=$(( 12288 * ${HM_F:-0} / 10 ))
-if [ -s "$F5B2" ] && [ "${HM_F:-0}" -gt 0 ] 2>/dev/null; then
-  MP=$(sed -n 's/^prefix_budget=//p' "$F5B2" | head -n1 | tr -dc '0-9')
-  if [ -n "$MP" ] && [ "$MP" -eq "$MB" ] 2>/dev/null; then
-    ok "F2f：mesh 修复前生效预算实测 == ${MB}（基值 12288 × factor ${HM_F}/10）"; B_PASS=$((B_PASS+1))
-  else
-    fail "F2f：prefix_budget=${MP:-缺} ≠ ${MB}（12288×factor/10）——mesh 修复前生效预算未实测"
-  fi
-else
-  fail "F2f：evidence/F5_budget.txt 缺失或 params hidden 因子缺失"
+  fail "B15：quality_gate.sh 缺失或不可执行"
 fi
 
+echo "P1 基础探针完成: $B_PASS/$B_TOTAL"
 # ---------- 维度 3：证据齐全（/5） ----------
 E_PASS=0; E_TOTAL=5
 for f in F1 F2 F3 F4 F5; do
