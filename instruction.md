@@ -63,7 +63,8 @@
    bash /app/tools/collect_meshd.sh     # → evidence/F5_meshd_status.txt（生效限额+来源）
    ```
    另须模型自产四份核验记录（格式见"验题契约"）：
-   - `evidence/F1_boundary.txt`：双侧边界探针——LIM−1024 须 200、LIM+4096 须 400/431；
+   - `evidence/F1_boundary.txt`：双侧边界探针——LIM−1024 须 200、LIM+4096 须 400/413/431
+     （502/404/5xx/无响应是链路故障而非限额拒绝，不得作为拒绝证据记录）；
    - `evidence/F2_restart.txt`：`supervisorctl restart all` **之后**的复探记录
      （post_restart_entry_big_status=200 / post_restart_backend_big_status=200）；
    - `evidence/F2_calibration.txt`：预警双侧标定——THRESH=LIM×WARN_RATIO/100，
@@ -79,10 +80,12 @@
    修复前后一个关键数值对比（修复前数值须与 Fx.out 实测一致）。
 
 ## 验题契约（tests/test.sh 的精确行为）
-**判定总则**：独立判分（判分环境无服务，只读 /app/ops/）。4 位小数写入
-/logs/verifier/reward.txt，诊断写 /logs/verifier/debug.txt。
+**判定总则**：共享判分（verifier 与作答环境同容器）——**基础维度的全部断言为判分器
+对活服务的行为探针（不可伪造）**：判分器自行发探针、读生效配置与组件日志、重启组件
+复证，不信任任何作答方转述的行为结论；evidence/ 文件仅用于证据存在性与报告引用维度。
+4 位小数写入 /logs/verifier/reward.txt，诊断写 /logs/verifier/debug.txt。
 `reward = min(P1, F6, F7)`——**三维短板定标**：任一维度最低分即总分（木桶原理）。
-- P1(运维修复清单) = 0.20×结构(/10) + 0.35×基础(/11) + 0.20×证据(/5) + 0.25×报告(/5)；
+- P1(运维修复清单) = 0.20×结构(/10) + 0.35×基础(/15) + 0.20×证据(/5) + 0.25×报告(/5)；
 - F6(headeragg 实现题) = 隐性差分套件 12 场景通过比例；
 - F7(calibrator 实现题) = 隐性对抗套件 12 场景通过比例。
 
@@ -95,7 +98,7 @@
 12 场景（100 并发精确计数、kill -9 重启精确恢复、多字节路由字节序、bytes 恰等
 THRESH 计 over、畸形事件拒绝、/a 与 /a/ 独立、状态损坏视为空、衔接累计）逐字段
 对照 /stats——任一字段不一致该场景即失败。**短板定标：F6 首试通过率即总分上限。**
-P1 = 0.20×结构(/10) + 0.35×基础(/11) + 0.20×证据(/5) + 0.25×报告(/5)。
+P1 = 0.20×结构(/10) + 0.35×基础(/15) + 0.20×证据(/5) + 0.25×报告(/5)。
 
 ## F7 实现题：calibrator（权重 0.85 · 隐性对抗验证）
 
@@ -107,23 +110,25 @@ invalid 桶、skipped 计数）逐字节对照参考实现——**场景每 tria
 种子随机生成，不预先披露**。通过比例 = F7 分。套件难度按首试通过率 0.3~0.5 校准，
 实现质量决定分数；运行修补只是入场券（P1 0.15）。
 
-| 维度 | 子项 | 判定 |
+| 维度 | 子项 | 判定（B1~B15 均为判分器对活服务的实测，不读作答方行为结论） |
 |---|---|---|
-| 结构 /10 | repro/Fx.sh + Fx.out ×5 | 可执行 且 .out 含对应修复前签名（见上表；F5 签名=生效限额 <17408） |
+| 结构 /10 | repro/Fx.sh + Fx.out ×5 | 可执行 且 .out 含对应修复前签名（见"两阶段交付"；F5 签名=生效限额 <17408） |
 | | fix/Fx.sh ×5 | 存在且可执行（封装该面实际修复动作） |
-| 基础 /13 | F1a | nginx_T 全部活动指令单缓冲 == params LIM（多条须一致；硬编码不通过） |
-| | F1b | F1_boundary：LIM−1024 行含 200、LIM+4096 行含 400/431 |
-| | F2a | backend_big_status=200 且 entry_big_status=200 且响应体 `"msg":"ok"` |
-| | F2d | 启动 banner 的 warn_threshold == params THRESH（预警阈值与容量参数联动，硬编码不通过） |
-| | F2b | F2_restart：post_restart_entry/backend_big_status=200 |
-| | F2c | F2_calibration：below_warnings_delta=0 且 above_warnings_delta≥1 且 above_max_observed≥THRESH |
-| | F3 | gate/mesh/baggage 恰 769/1537/512 且回显增幅恰 2306 |
-| | F4a | kafka_message_max_bytes_static > 16384 |
-| | F4b | F4_restart：含 marker= 且 event_seen=ok |
-| | F5a | F5_meshd_status：effective_limit ≥ 17408 |
-| | F5b | F5_restart：effective_limit ≥ 17408（restart all 后仍生效） |
-| | F2e | F3_budget：prefix_budget == 故障基值 10240 × hidden 因子（修复前生效预算实测，边界探针记录须在场） |
-| | F2f | F5_budget：prefix_budget == 故障基值 12288 × hidden 因子（mesh 修复前生效预算实测） |
+| 基础 /15 | B1 | nginx -T 全部活动指令单缓冲 == params LIM（多条须一致；硬编码不通过） |
+| | B2 | 双侧边界（LIVE 探针）：LIM−1024 → 200；LIM+4096 → **400/413/431 之一**（502/404/5xx/无响应是链路故障，不算限额拒绝） |
+| | B3 | 端到端大探针（LIVE）：入口与直连后端均 200 且响应体含 `"msg":"ok"` |
+| | B4 | backend 启动 banner 的 warn_threshold == params THRESH（预警阈值与容量参数联动，硬编码不通过） |
+| | B5 | 判分器自行 `supervisorctl restart all` 后复探：全链路仍 200（修复须持久化，重启即失效不通过） |
+| | B6 | 预警双侧标定（判分器清空 warnings.log 后自发自收）：THRESH+512 探针增量 ≥1；THRESH−1024 探针增量 =0 |
+| | B7 | tracegate 生效预算二分实测（LIVE 边界探针定位 431/400 翻转点）：实测值 ≥16384 且 ≤ LIM+4096 |
+| | B8 | mesh 生效预算二分实测（LIVE）：实测值 ≥16384 |
+| | B9 | 注入链规格（LIVE nonce 探针）：回显增幅恰 2306 且 MESHSTAT 增量恰 1537 |
+| | B10 | broker 限额双口径（LIVE）：静态落盘 >16384，且运行中 broker 的动态覆盖（若存在）也 >16384——dynamic 压过 static 的"假治理"不通过 |
+| | B11 | 标记事件落盘（LIVE Kafka 管道）：判分器发一次性 X-Case-Marker 标记探针，30s 内 trace_events.log 可见 |
+| | B12 | meshd 生效限额（LIVE meshd 日志）≥ 16384 |
+| | B13 | 隐藏采样周期可见（判分器发 30 个标记探针统计落盘率：有丢失=周期可见，全落盘=采样已移除——两种修复后状态均计通过） |
+| | B14 | 多字节规格差分（LIVE）：ASCII 与多字节路由的 mesh delta 均恰 1537（规格恢复） |
+| | B15 | 门禁脚本行为（判分器本地伪造日志）：干净日志 exit 0；access/hdrsize 注入 431 后 exit ≠ 0 |
 | 证据 /5 | F1~F5 | evidence/ 下各有至少一个 `Fx_*` 文件 |
 | 报告 /5 | 逐面引用 | 报告逐面引用 evidence/Fx_* 证据文件相对路径（F1~F5 各计 1 项） |
 

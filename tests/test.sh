@@ -2,12 +2,12 @@
 # =============================================================================
 # 431 任务验题脚本 v8 —— 共享判分 / 行为探针 / 短板定标
 # verifier 与作答环境同容器：全部基础断言为**对活服务的行为探针**（不可伪造）。
-# reward = 0.20×结构(/15) + 0.35×基础行为探针(/15) + 0.20×证据(/9) + 0.25×报告(/6)
-#   structure(/15)：repro+fix 脚本×10 + 诊断报告×1 + drafts×5（工作过程分）
+# reward = 0.20×结构(/10) + 0.35×基础行为探针(/15) + 0.20×证据(/5) + 0.25×报告(/5)
+#   structure(/10)：repro/Fx.sh+Fx.out 修复前签名 ×5 + fix/Fx.sh 可执行 ×5
 #   basic(/15)：15 项行为探针——直接对活服务做（nginx -T/边界探针/端到端/预算二分/
-#     nonce 注入链/server.properties/标记落盘/meshd 边界/采样周期/差分实验）——不可伪造
-#   evidence(/9)：五面采集文件+自产核验记录+预算记录 存在性
-#   quality(/6)：报告逐面引用×5 + F8/F9 修复前后数值咬合×1
+#     nonce 注入链/server.properties+动态覆盖/标记落盘/meshd 生效限额/采样周期/差分实验）
+#   evidence(/5)：五面采集文件存在性（evidence/Fx_*）
+#   quality(/5)：报告逐面引用证据路径 ×5
 # F6/F7 实现题套件保持不变（双实例差分/逐字节对抗——判分环境执行 ✓ 不可伪造）。
 # reward = min(P1, F6, F7)——短板定标。
 # =============================================================================
@@ -110,13 +110,15 @@ else
   fail "B1：nginx 单缓冲（${CNT} 条，${MINB:-无}~${MAXB:-无}）须全部 == LIM=${LIM:-缺}"
 fi
 
-# B2：双侧边界（LIVE nginx——LIM−1024 放行 / LIM+4096 拒绝）
+# B2：双侧边界（LIVE nginx——LIM−1024 放行 / LIM+4096 限额拒绝）
+# 拒绝语义白名单：400/413/431 是"header 超限"的真实拒绝码；502/404/5xx 是链路故障
+# （上游挂了/路由错），302 是重写，都不得算作"限额仍生效"的通过依据。
 BELOW_S=$(probe "$ENTRY/api/v1/profile" "$(( LIM - 1024 ))")
 ABOVE_S=$(probe "$ENTRY/api/v1/profile" "$(( LIM + 4096 ))")
-if [ "$BELOW_S" = "200" ] && printf '%s' "$ABOVE_S" | grep -qE '(^|[^0-9])(400|431|413|502)([^0-9]|$)'; then
-  ok "B2：双侧边界（LIM−1024=${BELOW_S} / LIM+4096=${ABOVE_S}）"; B_PASS=$((B_PASS+1))
+if [ "$BELOW_S" = "200" ] && printf '%s' "$ABOVE_S" | grep -qE '(^|[^0-9])(400|413|431)([^0-9]|$)'; then
+  ok "B2：双侧边界（LIM−1024=${BELOW_S} / LIM+4096=${ABOVE_S} 限额拒绝）"; B_PASS=$((B_PASS+1))
 else
-  fail "B2：双侧边界（below=${BELOW_S:-缺} above=${ABOVE_S:-缺}）"
+  fail "B2：双侧边界（below=${BELOW_S:-缺} 须 200；above=${ABOVE_S:-缺} 须为 400/413/431 之一——其余状态码是链路故障而非限额拒绝）"
 fi
 
 # B3：端到端大探针（LIVE 全链路）+ 响应体
@@ -214,11 +216,22 @@ else
   fail "B9：注入链规格（echo 增幅=${GRW} 须 2306 / mesh delta=${MD:-0} 须 1537）"
 fi
 
-# B10：broker 静态限额（LIVE server.properties——env 状态文件不可伪造）
+# B10：broker 限额双口径（LIVE server.properties 静态落盘 + 运行中 broker 动态覆盖）
+# 运行时生效限额 = 动态覆盖（kafka-configs 设置过的，重启后仍持久）若存在，否则静态
+# 落盘值——dynamic=16384 压过 static=65536 的"假治理"（改了文件没对齐运行态）在此现形。
 KAF_FILE="/opt/kafka/config/kraft/server.properties"
 KS=$(grep -oE '^message\.max\.bytes=[0-9]+' "$KAF_FILE" 2>/dev/null | grep -oE '[0-9]+' | head -n1)
+KAF_DYN="$(timeout 20 /opt/kafka/bin/kafka-configs.sh --bootstrap-server 127.0.0.1:9092 \
+  --entity-type brokers --entity-name 1 --describe 2>/dev/null \
+  | grep -oE 'message\.max\.bytes=[0-9]+' | head -n1 | grep -oE '[0-9]+')"
 if [ -n "$KS" ] && [ "$KS" -gt 16384 ] 2>/dev/null; then
-  ok "B10：broker 静态限额落盘 ${KS} > 16384"; B_PASS=$((B_PASS+1))
+  if [ -z "$KAF_DYN" ]; then
+    ok "B10：broker 静态限额 ${KS} > 16384（无动态覆盖，静态生效口径）"; B_PASS=$((B_PASS+1))
+  elif [ "$KAF_DYN" -gt 16384 ] 2>/dev/null; then
+    ok "B10：broker 限额 static=${KS} / 动态覆盖=${KAF_DYN} 均 >16384"; B_PASS=$((B_PASS+1))
+  else
+    fail "B10：broker 动态覆盖 ${KAF_DYN} ≤16384——运行中 broker 仍按旧限额拒审计事件（dynamic 压过 static，须 kafka-configs 动态对齐或清除覆盖）"
+  fi
 else
   fail "B10：broker 静态限额 ${KS:-缺} 须 >16384"
 fi
@@ -380,12 +393,6 @@ if [ -n "$LIM" ] && [ -n "$RATIO" ] && [ -x "$HAGG" ] && [ -x "$HREFB" ]; then
     sleep 0.6
   }
   post() { curl -s -X POST -d "$1" "http://127.0.0.1:$2/event" >/dev/null; }
-  cmpStats() {
-    a=$(curl -s "http://127.0.0.1:9200/stats")
-    r=$(curl -s "http://127.0.0.1:9300/stats")
-    if [ "$a" = "$r" ]; then F6_PASS=$((F6_PASS+1)); ok "F6 场景 $1 双实例一致"
-    else fail "F6 场景 $1 双实例不一致（agent=$r vs ref=$r2）"; fi
-  }
   cmpStats() {
     a=$(curl -s "http://127.0.0.1:9200/stats")
     r=$(curl -s "http://127.0.0.1:9300/stats")
