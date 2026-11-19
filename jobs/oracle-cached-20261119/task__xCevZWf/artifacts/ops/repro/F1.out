@@ -1,0 +1,4 @@
+# F1 取证（修复前）2026-11-19 09:34:27
+entry_big_status=400
+    large_client_header_buffers 4 8k;
+large_client_header_buffers 4 16k;

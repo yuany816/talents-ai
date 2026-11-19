@@ -1,0 +1,6 @@
+# F2c 双侧标定取证 2026-11-19 09:41:59（THRESH=32377=LIM 39485 × WARN_RATIO 82 / 100）
+below_probe_bytes=1024
+below_warnings_delta=0
+above_probe_bytes=32889
+above_warnings_delta=1
+above_max_observed=35949

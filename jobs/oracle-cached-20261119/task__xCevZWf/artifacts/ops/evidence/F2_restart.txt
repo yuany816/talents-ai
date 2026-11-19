@@ -1,0 +1,3 @@
+# F2 restart all 持久化取证 2026-11-19 09:41:45
+post_restart_entry_big_status=200
+post_restart_backend_big_status=200

@@ -1,0 +1,21 @@
+{
+    "schema_version": 1,
+    "id": "e2c77562-d586-4d0a-af3c-c4a668aa9487",
+    "started_at": "2026-11-19T17:10:06.835806",
+    "updated_at": "2026-11-19T09:10:07.295811Z",
+    "finished_at": null,
+    "n_total_trials": 1,
+    "stats": {
+        "n_completed_trials": 0,
+        "n_errored_trials": 0,
+        "n_running_trials": 1,
+        "n_pending_trials": 0,
+        "n_cancelled_trials": 0,
+        "n_retries": 0,
+        "evals": {},
+        "n_input_tokens": null,
+        "n_cache_tokens": null,
+        "n_output_tokens": null,
+        "cost_usd": null
+    }
+}

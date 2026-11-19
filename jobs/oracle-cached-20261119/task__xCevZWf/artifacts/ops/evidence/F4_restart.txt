@@ -1,0 +1,3 @@
+# F4 restart 持久化取证 2026-11-19 09:41:50
+marker=kaf1795081305622960418
+event_seen=ok

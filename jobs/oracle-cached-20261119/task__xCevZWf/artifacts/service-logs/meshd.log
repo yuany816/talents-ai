@@ -1,0 +1,30 @@
+2026/11/19 09:34:25 meshd listening on 127.0.0.1:15001 limit=17203B (source=env:MESH_HEADER_LIMIT(overrides sidecar.yaml), yaml_limit=12288B) span=2048B baggage=512B upstream=http://127.0.0.1:9000
+2026/11/19 09:41:01 meshd listening on 127.0.0.1:15001 limit=17203B (source=env:MESH_HEADER_LIMIT(overrides sidecar.yaml), yaml_limit=43581B) span=1536B baggage=512B upstream=http://127.0.0.1:9000
+2026/11/19 09:41:03 MESHSTAT path=/healthz total=62B limit=17203B trace_in=0B trace_out=1535B baggage=0B verdict=PASS
+2026/11/19 09:41:03 MESHSTAT path=/api/v1/profile total=110B limit=17203B trace_in=22B trace_out=1558B baggage=0B verdict=PASS
+2026/11/19 09:41:04 MESHSTAT path=/路由α total=120B limit=17203B trace_in=22B trace_out=1553B baggage=0B verdict=PASS
+2026/11/19 09:41:06 meshd listening on 127.0.0.1:15001 limit=1048576B (source=env:MESH_HEADER_LIMIT(overrides sidecar.yaml), yaml_limit=43581B) span=1536B baggage=512B upstream=http://127.0.0.1:9000
+2026/11/19 09:41:15 meshd listening on 127.0.0.1:15001 limit=1048576B (source=env:MESH_HEADER_LIMIT(overrides sidecar.yaml), yaml_limit=43581B) span=1536B baggage=512B upstream=http://127.0.0.1:9000
+2026/11/19 09:41:18 meshd listening on 127.0.0.1:15001 limit=1048576B (source=env:MESH_HEADER_LIMIT(overrides sidecar.yaml), yaml_limit=43581B) span=1536B baggage=512B upstream=http://127.0.0.1:9000
+2026/11/19 09:41:43 MESHSTAT path=/healthz total=955B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:41:45 MESHSTAT path=/api/v1/profile total=17364B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:41:45 MESHSTAT path=/api/v1/profile total=17364B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:41:45 MESHSTAT path=/api/v1/profile total=17402B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:41:50 MESHSTAT path=/api/v1/profile total=12211B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:41:50 MESHSTAT path=/api/v1/profile total=14259B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:41:50 MESHSTAT path=/api/v1/profile total=16266B limit=1048576B trace_in=0B trace_out=1536B baggage=512B verdict=PASS
+2026/11/19 09:41:50 MESHSTAT path=/api/v1/profile total=18314B limit=1048576B trace_in=0B trace_out=1536B baggage=512B verdict=PASS
+2026/11/19 09:41:54 MESHSTAT path=/路由α total=120B limit=1048576B trace_in=22B trace_out=1559B baggage=512B verdict=PASS
+2026/11/19 09:41:55 MESHSTAT path=/api/v1/profile total=2004B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:41:57 MESHSTAT path=/api/v1/profile total=33869B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:41:59 MESHSTAT path=/api/v1/profile total=39441B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:41:59 MESHSTAT path=/api/v1/profile total=17364B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:41:59 MESHSTAT path=/api/v1/profile total=962B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:41:59 MESHSTAT path=/healthz total=17357B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:41:59 MESHSTAT path=/api/v1/profile total=962B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:41:59 MESHSTAT path=/healthz total=17357B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:41:59 MESHSTAT path=/api/v1/profile total=963B limit=1048576B trace_in=791B trace_out=2328B baggage=512B verdict=PASS
+2026/11/19 09:42:02 MESHSTAT path=/api/v1/profile total=17364B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:42:04 MESHSTAT path=/api/v1/profile total=39441B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:42:04 MESHSTAT path=/api/v1/profile total=17364B limit=1048576B trace_in=790B trace_out=2327B baggage=512B verdict=PASS
+2026/11/19 09:42:06 meshd listening on 127.0.0.1:15001 limit=1048576B (source=env:MESH_HEADER_LIMIT(overrides sidecar.yaml), yaml_limit=43581B) span=1536B baggage=512B upstream=http://127.0.0.1:9000

@@ -1,0 +1,5 @@
+effective_limit=17203
+source=source=env
+yaml_max_header_bytes=43581
+startup_log=2026/11/19 09:41:01 meshd listening on 127.0.0.1:15001 limit=17203B (source=env:MESH_HEADER_LIMIT(overrides sidecar.yaml), yaml_limit=43581B) span=1536B baggage=512B upstream=http://127.0.0.1:9000
+supervisor_env=environment=MESH_HEADER_LIMIT="12288"

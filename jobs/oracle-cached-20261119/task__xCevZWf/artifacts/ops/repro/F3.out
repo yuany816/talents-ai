@@ -1,0 +1,5 @@
+# F3 取证（预算修复后、rune 压缩修复前）2026-11-19 09:41:05
+gate_delta=1536
+mesh_delta=1531
+gatestat_raw=2026/11/19 09:41:03 MESHSTAT path=/api/v1/profile total=110B limit=17203B trace_in=22B trace_out=1558B baggage=0B verdict=PASS
+meshstat_raw=2026/11/19 09:41:04 MESHSTAT path=/路由α total=120B limit=17203B trace_in=22B trace_out=1553B baggage=0B verdict=PASS

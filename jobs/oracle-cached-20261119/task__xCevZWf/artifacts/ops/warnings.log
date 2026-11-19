@@ -1,0 +1,3 @@
+HEADERWARN component=backend path=/api/v1/profile observed=35949B warn_threshold=32377B
+HEADERWARN component=backend path=/api/v1/profile observed=41521B warn_threshold=32377B
+HEADERWARN component=backend path=/api/v1/profile observed=41521B warn_threshold=32377B

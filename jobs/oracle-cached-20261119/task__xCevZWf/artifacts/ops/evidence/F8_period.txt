@@ -1,0 +1,5 @@
+# F8/F9 复证（修复后）2026-11-19 09:41:55
+measured_period=4
+post_fix_probes=30
+post_fix_landed=30
+post_multibyte_delta=1537
