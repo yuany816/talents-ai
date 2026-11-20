@@ -1,2 +1,5 @@
-design/
-review/
+jobs/
+trajectory/
+*.bak
+force_build.json
+.DS_Store

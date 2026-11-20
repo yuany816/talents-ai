@@ -13,7 +13,8 @@ version = "1.0"
 timeout_sec = 1200         # agent 解题的时间限制（秒），难题建议 900-1200
 
 [environment]
-build_timeout_sec = 600
+docker_image = "talents-ai-task:trae-v6"
+build_timeout_sec = 1200
 cpus = 1
 memory_mb = 4096
 storage_mb = 10240
