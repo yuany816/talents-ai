@@ -1,0 +1,25 @@
+agents:
+  trae_agent:
+    enable_lakeview: false
+    model: runtime_model
+    max_steps: 200
+    tools:
+    - bash
+    - str_replace_based_edit_tool
+    - sequentialthinking
+    - task_done
+model_providers:
+  openai:
+    api_key: sk-0********
+    provider: openai
+    base_url: https://api.deepseek.com
+models:
+  runtime_model:
+    model_provider: openai
+    model: deepseek-v4-pro
+    max_tokens: 16384
+    temperature: 0.7
+    top_p: 0.95
+    top_k: 20
+    max_retries: 10
+    parallel_tool_calls: true

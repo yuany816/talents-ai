@@ -1,0 +1,29 @@
+=== delivery ===
+ops_dir=present
+params: LIM=31816 WARN_RATIO=61 THRESH=19407
+repro/F1: sh=ok out=ok fix=ok
+repro/F2: sh=ok out=ok fix=ok
+repro/F3: sh=ok out=ok fix=ok
+repro/F4: sh=ok out=ok fix=ok
+repro/F5: sh=ok out=ok fix=ok
+evidence/F1_boundary.txt exists=yes
+evidence/F1_nginx_T.txt exists=yes
+evidence/F2_backend_status.txt exists=yes
+evidence/F2_calibration.txt exists=yes
+evidence/F2_restart.txt exists=yes
+evidence/F3_budget.txt exists=yes
+evidence/F3_span_count.txt exists=yes
+evidence/F4_kafka_audit.txt exists=yes
+evidence/F4_restart.txt exists=yes
+evidence/F5_budget.txt exists=yes
+evidence/F5_meshd_status.txt exists=yes
+evidence/F5_restart.txt exists=yes
+evidence/F8_period.txt exists=yes
+evidence/F9_offset.txt exists=yes
+=== dimensions ===
+structure=10/10
+basic=15/15
+edge=5/5
+quality=5/5
+repro_ok=5
+score=1.0000

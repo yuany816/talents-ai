@@ -1,0 +1,144 @@
+{
+    "schema_version": 1,
+    "id": "cf61ac44-9858-4eb0-9b87-3259d4fa7f57",
+    "task_name": "humanlaya/coding-task",
+    "trial_name": "task__W5N4ipq",
+    "trial_uri": "file:///Users/bytedance/Documents/test/talents-ai/jobs/2026-11-20__10-36-40/task__W5N4ipq",
+    "task_id": {
+        "path": "task"
+    },
+    "source": null,
+    "task_checksum": "a7271d751a19ef0ed8234ae97829d5b20f6d5679c03f8d45bf97c120e455530e",
+    "config": {
+        "schema_version": 1,
+        "task": {
+            "path": "task",
+            "git_url": null,
+            "git_commit_id": null,
+            "name": null,
+            "ref": null,
+            "overwrite": false,
+            "download_dir": null,
+            "source": null
+        },
+        "trial_name": "task__W5N4ipq",
+        "trials_dir": "jobs/2026-11-20__10-36-40",
+        "install_only": false,
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": null,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": "trae-agent",
+            "import_path": null,
+            "model_name": "openai/deepseek-v4-pro",
+            "base_url": null,
+            "model_api_key_name": null,
+            "model_api_format": null,
+            "skip_model_parsing": false,
+            "n_concurrent": null,
+            "concurrency_group": null,
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "resume_trajectory": false,
+            "load_trajectory": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {},
+            "mcp_servers": []
+        },
+        "user_agent": null,
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "stream": false,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "override_error_policy": {},
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "extra_instructions": [],
+        "job_id": "f6203078-d779-432f-85c6-fe06fb3ae67d",
+        "source_trial": null
+    },
+    "agent_info": {
+        "name": "trae-agent",
+        "version": "version 0.1.0",
+        "model_info": {
+            "name": "deepseek-v4-pro",
+            "provider": "openai"
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 4026318,
+        "n_cache_tokens": 3946240,
+        "n_output_tokens": 50254,
+        "cost_usd": null,
+        "model_usage": {
+            "deepseek-v4-pro": {
+                "n_input_tokens": 4026318,
+                "n_cache_tokens": 3946240,
+                "n_output_tokens": 50254,
+                "cost_usd": null
+            }
+        },
+        "rollout_details": null,
+        "metadata": null
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 0.0
+        }
+    },
+    "verifier_environment_mode": "shared",
+    "exception_info": {
+        "exception_type": "AgentTimeoutError",
+        "exception_message": "Agent execution timed out after 1200.0 seconds",
+        "exception_traceback": "Traceback (most recent call last):\n  File \"/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/asyncio/tasks.py\", line 510, in wait_for\n    return await fut\n           ^^^^^^^^^\n  File \"/Users/bytedance/Library/Python/3.12/lib/python/site-packages/harbor/agents/installed/base.py\", line 194, in wrapper\n    return await fn(self, instruction, *args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/bytedance/Library/Python/3.12/lib/python/site-packages/harbor/agents/installed/trae_agent.py\", line 309, in run\n    await self.exec_as_agent(\n  File \"/Users/bytedance/Library/Python/3.12/lib/python/site-packages/harbor/agents/installed/base.py\", line 1114, in exec_as_agent\n    return await self._exec(\n           ^^^^^^^^^^^^^^^^^\n  File \"/Users/bytedance/Library/Python/3.12/lib/python/site-packages/harbor/agents/installed/base.py\", line 1065, in _exec\n    result = await environment.exec(\n             ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/bytedance/Library/Python/3.12/lib/python/site-packages/harbor/environments/docker/docker.py\", line 1407, in exec\n    return await self._compose_exec(\n           ^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/bytedance/Library/Python/3.12/lib/python/site-packages/harbor/environments/docker/docker.py\", line 1484, in _compose_exec\n    return await self._run_docker_compose_command(\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/bytedance/Library/Python/3.12/lib/python/site-packages/harbor/environments/docker/docker.py\", line 801, in _run_docker_compose_command\n    result = await self._collect_buffered_output(\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/bytedance/Library/Python/3.12/lib/python/site-packages/harbor/environments/docker/docker.py\", line 831, in _collect_buffered_output\n    stdout_bytes, stderr_bytes = await process.communicate(input=stdin_data)\n                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/asyncio/subprocess.py\", line 199, in communicate\n    stdin, stdout, stderr = await tasks.gather(stdin, stdout, stderr)\n                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/asyncio/subprocess.py\", line 179, in _read_stream\n    output = await stream.read()\n             ^^^^^^^^^^^^^^^^^^^\n  File \"/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/asyncio/streams.py\", line 688, in read\n    block = await self.read(self._limit)\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/asyncio/streams.py\", line 695, in read\n    await self._wait_for_data('read')\n  File \"/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/asyncio/streams.py\", line 527, in _wait_for_data\n    await self._waiter\nasyncio.exceptions.CancelledError\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/Users/bytedance/Library/Python/3.12/lib/python/site-packages/harbor/trial/trial.py\", line 780, in _run_agent_phase\n    await asyncio.wait_for(\n  File \"/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/asyncio/tasks.py\", line 509, in wait_for\n    async with timeouts.timeout(timeout):\n  File \"/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/asyncio/timeouts.py\", line 111, in __aexit__\n    raise TimeoutError from exc_val\nTimeoutError\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/Users/bytedance/Library/Python/3.12/lib/python/site-packages/harbor/trial/single_step.py\", line 77, in _run_agent\n    await self._run_agent_phase(\n  File \"/Users/bytedance/Library/Python/3.12/lib/python/site-packages/harbor/trial/trial.py\", line 789, in _run_agent_phase\n    raise AgentTimeoutError(\nharbor.trial.errors.AgentTimeoutError: Agent execution timed out after 1200.0 seconds\n",
+        "occurred_at": "2026-11-20T02:57:20.045195Z",
+        "policy": {
+            "should_retry": false,
+            "should_grade": true,
+            "has_valid_reward": true
+        }
+    },
+    "started_at": "2026-11-20T02:37:03.761409Z",
+    "finished_at": "2026-11-20T02:58:17.704459Z",
+    "environment_setup": {
+        "started_at": "2026-11-20T02:37:04.100134Z",
+        "finished_at": "2026-11-20T02:37:07.894104Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-11-20T02:37:07.894220Z",
+        "finished_at": "2026-11-20T02:37:18.725202Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-11-20T02:37:18.726197Z",
+        "finished_at": "2026-11-20T02:57:19.989369Z"
+    },
+    "verifier": {
+        "started_at": "2026-11-20T02:57:20.750899Z",
+        "finished_at": "2026-11-20T02:58:14.109655Z"
+    },
+    "step_results": null,
+    "reward_valid": true
+}

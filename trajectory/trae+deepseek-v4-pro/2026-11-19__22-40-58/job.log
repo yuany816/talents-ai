@@ -1,0 +1,6 @@
+Inference credentials: 1 mappings across 1 trials
+trae-agent / native default (1 trials): native authentication; base URL=unknown (configured/default); API format=openai_responses (agent_default)
+Skipping image OS validation for hb__210672f28c0d8724dd0df33c5679ade7: docker inspect returned 1
+Running command: apt-get update && apt-get install -y git
+Command outputs captured
+Running command: set -euo pipefail; if ! command -v uv &>/dev/null; then  curl -LsSf https://astral.sh/uv/install.sh | sh &&  export PATH="$HOME/.local/bin:$PATH"; fi && uv tool install --python 3.12 "trae-agent[test,evaluation] @ git+https://github.com/bytedance/trae-agent.git" && export PATH="$HOME/.local/bin:$PATH" && trae-cli --help

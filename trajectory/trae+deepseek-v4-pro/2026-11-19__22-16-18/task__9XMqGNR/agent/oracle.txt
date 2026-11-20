@@ -1,0 +1,27 @@
+[solve.sh] params: LIM=31816 WARN_RATIO=61 THRESH=19407
+[solve.sh] ① 阶段1取证（修复前）
+[solve.sh] 取证完成（含 F8 落盘率 0/30——F9 差分取证移至预算修复后执行）
+[solve.sh] 取证完成（修复前签名已落盘）
+[solve.sh] ② F1 nginx（large_client_header_buffers 4 31816）
+[solve.sh] ③ F2 backend（配额/框架/存档 → 1048576 + 预警中间件阈值 19407）
+[solve.sh] ④ F3 tracegate（预算→1048576，span_bytes 384→768，注入偏移修正）
+[solve.sh] ④b F5 meshd（限额双口径 → 1048576；span_bytes 2048→1536；注入偏移修正）
+[solve.sh] F9 差分取证: ascii=1536 multibyte=1531（若两者不同即 rune 口径偏移证据）
+[solve.sh] ⑤ F4 kafka（message.max.bytes → 1048576）
+[solve.sh] collector topic 已对齐 trace-events
+[solve.sh] ⑥ restart all 持久化自证
+[solve.sh] ⑦ F4b：重启后标记事件复证
+[solve.sh] F2e/F2f 预算实测: tracegate=14336 mesh=17203
+[solve.sh] ⑧ F2c 预警双侧标定（THRESH=19407）
+[solve.sh] 标定: below_delta=0（须0） above_delta=1（须≥1） max=22979（须≥THRESH）
+[solve.sh] ⑨ F1b 双侧边界
+[solve.sh] ⑩ repro 脚本交付
+[solve.sh] ⑦b quality_gate 交付
+[solve.sh] ⑪ 五面证据采集
+[solve.sh] ⑫ 诊断报告
+[solve.sh] ⑬ F7 calibrator 交付（/app/ops/bin/calibrator）
+[solve.sh] F7 交付完成（实现与判分参考实现同语义——规格钉子逐条覆盖）
+[solve.sh] ⑭ F6 headeragg 交付（/app/ops/bin/headeragg）
+[solve.sh] F6 交付完成（并发精确/行级持久化/重启精确恢复/多字节/边界/畸形拒绝——规格钉子逐条覆盖）
+[solve.sh] 交付: repro/F1.out F1.sh F2.out F2.sh F3.out F3.sh F4.out F4.sh F5.out F5.sh F8.out F8_markers.list F9.out  evidence/F1_boundary.txt F1_nginx_T.txt F2_backend_status.txt F2_calibration.txt F2_restart.txt F3_budget.txt F3_span_count.txt F4_kafka_audit.txt F4_restart.txt F5_budget.txt F5_meshd_status.txt F5_restart.txt F8_period.txt F9_offset.txt 
+[solve.sh] 结果: PASS —— 五面修复完成，前置取证/持久化/标定证据齐备

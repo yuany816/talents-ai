@@ -1,0 +1,16 @@
+=== delivery ===
+ops_dir=present
+params: LIM=21500 WARN_RATIO=59 THRESH=12685
+repro/F1: sh=ok out=ok fix=ok
+repro/F2: sh=ok out=ok fix=ok
+repro/F3: sh=ok out=ok fix=ok
+repro/F4: sh=ok out=ok fix=ok
+repro/F5: sh=ok out=ok fix=ok
+evidence/F3_span_count.txt exists=yes
+=== dimensions ===
+structure=10/10
+basic=14/15
+edge=1/5
+quality=0/5
+repro_ok=5
+score=0.0000
