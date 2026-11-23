@@ -1,0 +1,30 @@
+{
+  "date": "2026-11-23",
+  "agent": "codex",
+  "model": "gpt-6.1-sol",
+  "params": {
+    "LIM": 30066,
+    "WARN_RATIO": 50,
+    "THRESH": 15033
+  },
+  "scores": {
+    "P1": 0.9567,
+    "F6": 1.0,
+    "F7": 0.4167,
+    "final": 0.4167
+  },
+  "F6": {
+    "passed": 12,
+    "total": 12
+  },
+  "F7": {
+    "passed": 5,
+    "total": 12,
+    "passing_scenarios": ["sc01", "sc02", "sc07", "sc11", "sc12"],
+    "failing_scenarios": ["sc03", "sc04", "sc05", "sc06", "sc08", "sc09", "sc10"]
+  },
+  "gates": {
+    "oracle": 1.0,
+    "nop": 0.0
+  }
+}

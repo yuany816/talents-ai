@@ -3,7 +3,7 @@ package main
 // gen-calibrator v2 —— F7 复合场景生成器（种子 = params）
 // 12 个复合流：每流组合 4~6 条交互规则（合并 SUM / 字节序排序 / 多字节 / JSON 转义
 // 膨胀 / 精确 THRESH 边界 / 解析顺序 / skipped 计数 / invalid 桶 / 尾斜杠路由），
-// 任一规则实现偏差 → 该场景逐字节对照失败 → 首试通过率被压到 ≤0.5。
+// 任一规则实现偏差 → 该场景逐字节对照失败；基线回答目标通过 5/12（0.4167）。
 import (
 	"crypto/sha256"
 	"encoding/json"
@@ -37,7 +37,6 @@ func rnd(n int) int {
 	seed = seed*6364136223846793005 + 1442695040888963407
 	return int((seed >> 33) % uint64(n))
 }
-
 
 func mkev(ts int64, route string, hdrs map[string][]*string) string {
 	b, _ := json.Marshal(map[string]interface{}{"ts": ts, "route": route, "headers": hdrs})
@@ -124,10 +123,10 @@ func main() {
 	sc01 := []string{
 		mkev(1000, rpick(1)+"/α", map[string][]*string{"中文头": {sp(vfill(2))}}),
 		mkev(1000, rpick(1)+"/α", map[string][]*string{"中文头": {sp(vfill(3))}}),
-		padTo(1000, "/路由/α", "X-Pad", thresh-e1-e2),                 // 合并后总和恰 == THRESH → over≥1
+		padTo(1000, "/路由/α", "X-Pad", thresh-e1-e2), // 合并后总和恰 == THRESH → over≥1
 		mkev(2000, rpick(2)+"/β", map[string][]*string{"X": {sp(vfill(4))}}),
-		padTo(2000, "/路由/β", "X-Pad", thresh+1-e3),                  // 恰 THRESH+1 → OVER
-		"", "# comment", "not-json {{{",                              // skipped×3
+		padTo(2000, "/路由/β", "X-Pad", thresh+1-e3), // 恰 THRESH+1 → OVER
+		"", "# comment", "not-json {{{", // skipped×3
 	}
 	writeStream(dir, 1, sc01)
 
@@ -141,9 +140,9 @@ func main() {
 	}
 	writeStream(dir, 2, sc02)
 
-	// sc03：JSON 转义膨胀 × 引号反斜杠控制字符 × 合并 —— 观测字节数由转义后长度决定
+	// sc03：JSON 转义膨胀 × U+2028/U+2029 × 引号反斜杠控制字符 × 合并
 	sc03 := []string{
-		mkev(100, "/esc", map[string][]*string{"X-Q": {sp("\"\"\\\\\\"), sp("\u0001\u001f")}}),
+		mkev(100, "/esc", map[string][]*string{"X-Q": {sp("\"\"\\\\\\"), sp("\u0001\u001f"), sp("line\u2028paragraph\u2029")}}),
 		mkev(100, "/esc", map[string][]*string{"X-Q": {sp("mm")}}),
 	}
 	writeStream(dir, 3, sc03)
@@ -166,11 +165,13 @@ func main() {
 	}
 	writeStream(dir, 5, sc05)
 
-	// sc06：ts=0 桶 × 合并 × 精确边界
+	// sc06：ts=0 桶 × 合并 × 精确边界 × headers 缺失/null 规范化为空对象
 	sc06 := []string{
 		padTo(0, "/zero", "X-Pad", thresh),
 		mkev(0, "/zero", map[string][]*string{"B": {sp("q")}}),
 		padTo(0, "/zero", "X-Pad2", thresh+512),
+		`{"ts":1,"route":"/empty-headers"}`,
+		`{"ts":2,"route":"/null-headers","headers":null}`,
 	}
 	writeStream(dir, 6, sc06)
 
@@ -184,25 +185,31 @@ func main() {
 	}
 	writeStream(dir, 7, sc07)
 
-	// sc08：超大值 64KB × 合并 × over
+	// sc08：超大值 64KB × null header 值 × 合并 × over
 	huge := strings.Repeat("H", 65536)
 	sc08 := []string{
 		mkev(100, "/huge", map[string][]*string{"X-Huge": {sp(huge)}}),
 		mkev(100, "/huge", map[string][]*string{"X-Huge": {sp(huge)}}),
+		`{"ts":101,"route":"/nullable","headers":{"X-Nullable":["before",null,"after"]}}`,
 	}
 	writeStream(dir, 8, sc08)
 
-	// sc09：转义膨胀 × 精确 THRESH−1024 静默（转义膨胀计入观测——静默探针须补偿）
+	// sc09：转义膨胀 × 精确 THRESH−1024 静默 × int64 溢出归 invalid
 	silentEsc := padTo(100, "/escq", "X-Esc", thresh-1024)
-	sc09 := []string{silentEsc, mkev(100, "/escq", map[string][]*string{"X-plain": {&[]string{"a"}[0]}})}
+	sc09 := []string{
+		silentEsc,
+		mkev(100, "/escq", map[string][]*string{"X-plain": {&[]string{"a"}[0]}}),
+		`{"ts":9223372036854775808,"route":"/overflow","headers":{"A":["x"]}}`,
+	}
 	writeStream(dir, 9, sc09)
 
-	// sc10：尾斜杠路由（/a 与 /a/ 是不同 route）× 合并 × 排序
+	// sc10：尾斜杠路由（/a 与 /a/ 是不同 route）× null ts 跳过 × 合并 × 排序
 	sc10 := []string{
 		mkev(100, "/a", map[string][]*string{"A": {sp("1")}}),
 		mkev(100, "/a/", map[string][]*string{"A": {sp("2")}}),
 		mkev(100, "/a", map[string][]*string{"A": {sp("3")}}),
 		mkev(100, "/a/", map[string][]*string{"A": {sp("4")}}),
+		`{"ts":null,"route":"/null-ts","headers":{"A":["x"]}}`,
 	}
 	writeStream(dir, 10, sc10)
 

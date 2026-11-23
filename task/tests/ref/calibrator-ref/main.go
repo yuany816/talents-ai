@@ -6,7 +6,7 @@ package main
 //   - observed = 规范化再序列化的 UTF-8 字节长；HTML 字符（< > &）不转义；
 //   - headers 键按字节序升序重排、紧凑序列化；
 //   - 同 route+ts 合并：observed 取总和、events 计 1；
-//   - ts 缺失/非十进制整数/负数 → <invalid> 桶；非事件行全部计入 skipped；
+//   - ts/route 缺失或 ts=null → skipped；其余非十进制整数/负数/溢出 → <invalid> 桶；
 //   - 输出按 route 字节序升序、桶内按 ts 升序；<invalid> 固定最后。
 import (
 	"bufio"

@@ -1,0 +1,15 @@
+=== delivery ===
+ops_dir=present
+params: LIM=20820 WARN_RATIO=72 THRESH=14990
+repro/F1: sh=no out=no fix=no
+repro/F2: sh=no out=no fix=no
+repro/F3: sh=no out=no fix=no
+repro/F4: sh=no out=no fix=no
+repro/F5: sh=no out=no fix=no
+=== dimensions ===
+structure=0/10
+basic=3/15
+edge=0/5
+quality=0/5
+repro_ok=0
+score=0.0000
